@@ -1,0 +1,31 @@
+{
+    "start_time": "2026-04-25T18:54:45.239141",
+    "source_lsb": "C:\\Users\\DELL\\Documents\\Capstone\\archive",
+    "source_pvd": "C:\\Users\\DELL\\Documents\\Capstone\\Stego-pvd-dataset",
+    "output": "C:\\Users\\DELL\\Documents\\Capstone\\data\\combined",
+    "splits": {
+        "train": {
+            "clean": 8000,
+            "lsb": 12000,
+            "pvd": 3995
+        },
+        "test": {
+            "clean": 4000,
+            "lsb": 18000,
+            "pvd": 2000
+        },
+        "val": {
+            "clean": 4000,
+            "lsb": 6000,
+            "pvd": 2000
+        }
+    },
+    "corrupt_files": [],
+    "failed_copies": [],
+    "end_time": "2026-04-25T18:57:54.304731",
+    "class_map": {
+        "clean": 0,
+        "lsb": 1,
+        "pvd": 2
+    }
+}
