@@ -26,9 +26,9 @@ from modules.module1_cnn import StegoClassifier, load_pretrained_stego
 from modules.dataset import get_transforms
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Global state: load models on startup
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 PIPELINE_LOADED = False
 MODEL = None
 TRANSFORM = None
@@ -40,7 +40,7 @@ def load_models():
 
     checkpoint_path = config.MODULE1_CHECKPOINT_DIR / "best_model.pth"
     if not checkpoint_path.exists():
-        print(f"⚠  Model not found at {checkpoint_path}")
+        print(f"[WARN] Model not found at {checkpoint_path}")
         print("   Run training first: python training/train_module1.py")
         return False
 
@@ -48,16 +48,16 @@ def load_models():
         MODEL = load_pretrained_stego(str(checkpoint_path), device=config.DEVICE)
         TRANSFORM = get_transforms("test")
         PIPELINE_LOADED = True
-        print("✓ Models loaded successfully!")
+        print("[OK] Models loaded successfully!")
         return True
     except Exception as e:
-        print(f"✗ Failed to load models: {e}")
+        print(f"[FAIL] Failed to load models: {e}")
         return False
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Analysis functions
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 
 def analyze_single_image(image, show_technical):
     """
@@ -67,7 +67,7 @@ def analyze_single_image(image, show_technical):
     """
     if image is None:
         return (
-            "⚠️ Please upload an image",   # detection result
+            "[WARN] Please upload an image",   # detection result
             "",                              # risk level
             "",                              # details
             "",                              # technical details
@@ -76,14 +76,14 @@ def analyze_single_image(image, show_technical):
 
     if not PIPELINE_LOADED:
         return (
-            "⚠️ Models not loaded. Run training first:\n  python training/train_module1.py",
+            "[WARN] Models not loaded. Run training first:\n  python training/train_module1.py",
             "", "", "", None,
         )
 
     start_time = time.time()
 
     try:
-        # ── Preprocess ────────────────────────────────────────────────
+        # -- Preprocess ------------------------------------------------
         if isinstance(image, np.ndarray):
             pil_image = Image.fromarray(image).convert("RGB")
         else:
@@ -92,7 +92,7 @@ def analyze_single_image(image, show_technical):
         # Check minimum size
         w, h = pil_image.size
         if w < 100 or h < 100:
-            return ("⚠️ Image must be at least 100×100 pixels", "", "", "", None)
+            return ("[WARN] Image must be at least 100x100 pixels", "", "", "", None)
 
         # Transform and predict
         input_tensor = TRANSFORM(pil_image).unsqueeze(0).to(config.DEVICE)
@@ -107,30 +107,30 @@ def analyze_single_image(image, show_technical):
 
         processing_time = (time.time() - start_time) * 1000  # ms
 
-        # ── Format detection result ───────────────────────────────────
+        # -- Format detection result -----------------------------------
         class_name = config.CLASS_NAMES[pred_idx]
         if class_name == "clean":
-            detection_text = f"✅ CLEAN — No steganography detected ({conf*100:.1f}% confidence)"
-            risk_level = "🟢 Risk Level: None"
+            detection_text = f"[CLEAN] CLEAN - No steganography detected ({conf*100:.1f}% confidence)"
+            risk_level = "Risk Level: None"
             details = "No hidden data was found in this image."
         elif class_name == "lsb":
-            detection_text = f"🔴 LSB Steganography Detected — {conf*100:.1f}% confidence"
-            risk_level = "🟠 Risk Level: High"
+            detection_text = f"[STEGO] LSB Steganography Detected - {conf*100:.1f}% confidence"
+            risk_level = "Risk Level: High"
             details = (
                 f"**Technique:** LSB (Least Significant Bit)\n\n"
                 f"The CNN model has detected LSB steganography patterns in this image. "
                 f"Hidden data may be embedded in the least significant bits of pixel values."
             )
         else:  # pvd
-            detection_text = f"🔴 PVD Steganography Detected — {conf*100:.1f}% confidence"
-            risk_level = "🟠 Risk Level: High"
+            detection_text = f"[STEGO] PVD Steganography Detected - {conf*100:.1f}% confidence"
+            risk_level = "Risk Level: High"
             details = (
                 f"**Technique:** PVD (Pixel Value Differencing)\n\n"
                 f"The CNN model has detected PVD steganography patterns in this image. "
                 f"Hidden data may be embedded using pixel pair differences."
             )
 
-        # ── Technical details ─────────────────────────────────────────
+        # -- Technical details -----------------------------------------
         if show_technical:
             tech_text = (
                 f"**CNN Prediction Probabilities:**\n"
@@ -146,7 +146,7 @@ def analyze_single_image(image, show_technical):
         else:
             tech_text = ""
 
-        # ── JSON report ───────────────────────────────────────────────
+        # -- JSON report -----------------------------------------------
         report = {
             "detection": class_name,
             "confidence": round(conf, 4),
@@ -163,16 +163,16 @@ def analyze_single_image(image, show_technical):
         return (detection_text, risk_level, details, tech_text, str(report_path))
 
     except Exception as e:
-        return (f"❌ Error: {str(e)}", "", "", "", None)
+        return (f"[ERROR] Error: {str(e)}", "", "", "", None)
 
 
 def analyze_batch(files):
     """Analyze multiple images and return a summary table."""
     if not files:
-        return "⚠️ Please upload images", None
+        return "[WARN] Please upload images", None
 
     if not PIPELINE_LOADED:
-        return "⚠️ Models not loaded. Run training first.", None
+        return "[WARN] Models not loaded. Run training first.", None
 
     results = []
     for file_obj in files:
@@ -207,7 +207,7 @@ def analyze_batch(files):
     pvd_count = sum(1 for r in results if r["Technique"] == "PVD")
     summary = (
         f"**Results:** {len(results)} images analyzed\n\n"
-        f"🟢 Clean: {clean_count}  |  🔴 LSB: {lsb_count}  |  🔴 PVD: {pvd_count}"
+        f"Clean: {clean_count}  |  LSB: {lsb_count}  |  PVD: {pvd_count}"
     )
 
     # Build table
@@ -217,9 +217,9 @@ def analyze_batch(files):
     return summary, df
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 # Gradio UI
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 
 CUSTOM_CSS = """
 .gradio-container {
@@ -297,7 +297,7 @@ def build_ui():
             elem_classes=["subtitle"],
         )
 
-        # ── Tab 1: Analyze Image ─────────────────────────────────────
+        # -- Tab 1: Analyze Image -------------------------------------
         with gr.Tab("🖼️ Analyze Image"):
             with gr.Row():
                 with gr.Column(scale=1):
@@ -329,7 +329,7 @@ def build_ui():
                 outputs=[detection_output, risk_output, details_output, tech_output, report_download],
             )
 
-        # ── Tab 2: Batch Analysis ────────────────────────────────────
+        # -- Tab 2: Batch Analysis ------------------------------------
         with gr.Tab("📊 Batch Analysis"):
             gr.Markdown("Upload multiple images (max 20) for bulk analysis.")
             file_input = gr.Files(
@@ -351,19 +351,19 @@ def build_ui():
                 outputs=[batch_summary, batch_table],
             )
 
-        # ── Tab 3: About ─────────────────────────────────────────────
+        # -- Tab 3: About ---------------------------------------------
         with gr.Tab("ℹ️ About"):
             gr.Markdown(ABOUT_TEXT)
 
     return demo
 
 
-# ──────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     # Try loading models (will warn if not trained yet)
     loaded = load_models()
     if not loaded:
-        print("\n⚠  Starting UI without models — analysis will show error messages.")
+        print("\n[WARN] Starting UI without models - analysis will show error messages.")
         print("   Train the model first: python training/train_module1.py\n")
 
     demo = build_ui()
