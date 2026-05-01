@@ -94,8 +94,26 @@ def analyze_single_image(image, show_technical):
         if w < 100 or h < 100:
             return ("[WARN] Image must be at least 100x100 pixels", "", "", "", None)
 
-        # Transform and predict
-        input_tensor = TRANSFORM(pil_image).unsqueeze(0).to(config.DEVICE)
+        # Transform
+        input_tensor = TRANSFORM(pil_image)
+
+        if getattr(MODEL, 'use_noise_residual', False):
+            import cv2
+            
+            img_np = np.array(pil_image)
+            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+            laplacian = cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F)
+            
+            laplacian = np.clip(laplacian, -50, 50)
+            laplacian_norm = (laplacian + 50) / 100.0
+            
+            size = config.CNN_CONFIG["input_size"]
+            laplacian_resized = cv2.resize(laplacian_norm, (size, size))
+            
+            noise_channel = torch.tensor(laplacian_resized, dtype=torch.float32).unsqueeze(0)
+            input_tensor = torch.cat([input_tensor, noise_channel], dim=0)
+
+        input_tensor = input_tensor.unsqueeze(0).to(config.DEVICE)
         pred_class, confidence, probs = MODEL.predict_with_confidence(input_tensor)
 
         pred_idx = pred_class.item()

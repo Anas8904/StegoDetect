@@ -231,9 +231,9 @@ def train(args):
             start_epoch = checkpoint["epoch"]
             best_val_f1 = checkpoint.get("best_val_f1", 0.0)
             patience_counter = checkpoint.get("patience_counter", 0)
-            print(f"\n✓ Resumed from epoch {start_epoch} (best F1: {best_val_f1:.4f})")
+            print(f"\n[*] Resumed from epoch {start_epoch} (best F1: {best_val_f1:.4f})")
         else:
-            print(f"\n⚠  No checkpoint found at {last_path}, starting fresh.")
+            print(f"\n[!] No checkpoint found at {last_path}, starting fresh.")
 
     # ── Training log CSV (append mode if resuming) ────────────────────
     log_mode = "a" if args.resume and log_path.exists() else "w"
@@ -261,7 +261,7 @@ def train(args):
             phase_str = f"Phase 2 (full fine-tuning)"
 
         # ── Set up optimizer for current phase ────────────────────────
-        if current_epoch == 1 or (current_epoch == phase1_epochs + 1):
+        if current_epoch == 1 or (current_epoch == phase1_epochs + 1) or epoch == start_epoch:
             if phase == 1:
                 freeze_backbone_layers(model, num_layers_to_freeze=-1)
                 optimizer = AdamW(
@@ -360,12 +360,11 @@ def train(args):
         if current_epoch % 10 == 0:
             torch.save(checkpoint_data, ckpt_dir / f"checkpoint_epoch_{current_epoch}.pth")
 
-        # Save best model (based on val F1)
         if val_f1_macro > best_val_f1:
             best_val_f1 = val_f1_macro
             patience_counter = 0
             torch.save(checkpoint_data, ckpt_dir / "best_model.pth")
-            print(f"  ★ New best model saved! (F1: {best_val_f1:.4f})")
+            print(f"  [*] New best model saved! (F1: {best_val_f1:.4f})")
         else:
             patience_counter += 1
             print(f"  No improvement ({patience_counter}/{config.CNN_CONFIG['early_stopping_patience']})")
@@ -375,7 +374,7 @@ def train(args):
 
         # ── Early stopping ────────────────────────────────────────────
         if patience_counter >= config.CNN_CONFIG["early_stopping_patience"]:
-            print(f"\n⚠  Early stopping triggered at epoch {current_epoch}")
+            print(f"\n[!] Early stopping triggered at epoch {current_epoch}")
             break
 
         # Clear CUDA cache
@@ -432,9 +431,9 @@ def train(args):
         fpr_clean = false_positive_clean / clean_total
         print(f"\nClean Image False Positive Rate: {100*fpr_clean:.2f}%")
         if fpr_clean > 0.02:
-            print(f"  ⚠  WARNING: FPR ({100*fpr_clean:.2f}%) exceeds 2% target!")
+            print(f"  [!] WARNING: FPR ({100*fpr_clean:.2f}%) exceeds 2% target!")
         else:
-            print(f"  ✓  FPR is within the 2% target")
+            print(f"  [*] FPR is within the 2% target")
 
     # Save test metrics
     test_metrics = {

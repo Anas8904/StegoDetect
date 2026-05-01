@@ -135,12 +135,9 @@ class StegoDataset(Dataset):
             gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
             laplacian = cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F)
 
-            # Normalize to [0, 1]
-            lap_min, lap_max = laplacian.min(), laplacian.max()
-            if lap_max - lap_min > 0:
-                laplacian_norm = (laplacian - lap_min) / (lap_max - lap_min)
-            else:
-                laplacian_norm = np.zeros_like(laplacian)
+            # Clip extreme values and scale to [0, 1] to preserve noise variance
+            laplacian = np.clip(laplacian, -50, 50)
+            laplacian_norm = (laplacian + 50) / 100.0
 
             # Resize to match transform output size
             size = config.CNN_CONFIG["input_size"]

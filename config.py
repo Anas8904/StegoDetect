@@ -66,8 +66,8 @@ CNN_CONFIG = {
     "model_name": "efficientnet_b0",
     "input_size": 224,
     "num_classes": NUM_CLASSES,
-    "dropout": 0.3,
-    "use_noise_residual": False,
+    "dropout": 0.4,
+    "use_noise_residual": True,
 
     # Training
     "epochs": 50,
@@ -75,7 +75,7 @@ CNN_CONFIG = {
     "num_workers": 4,
 
     # Phase 1 (frozen backbone, epochs 1-10)
-    "phase1_epochs": 10,
+    "phase1_epochs": 0,
     "phase1_lr": 1e-3,
 
     # Phase 2 (unfrozen, epochs 11-50)
