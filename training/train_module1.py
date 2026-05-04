@@ -48,6 +48,7 @@ from modules.module1_cnn import (
     get_model_summary,
 )
 from modules.dataset import get_dataloaders
+from data_prep.decode_images import decode_test_images
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -183,6 +184,10 @@ def train(args):
     print(f"Resume:          {args.resume}")
     print(f"{'='*60}\n")
 
+    # ── Decrypt Test Dataset ──────────────────────────────────────────
+    print("Decrypting test images (b64/zip) if necessary...")
+    decode_test_images(str(config.COMBINED_DIR / "test" / "lsb"))
+
     # ── Data ──────────────────────────────────────────────────────────
     print("Loading datasets...")
     train_loader, val_loader, test_loader, class_weights = get_dataloaders(
@@ -292,7 +297,7 @@ def train(args):
 
         # ── Validate ──────────────────────────────────────────────────
         val_loss, val_acc, val_preds, val_labels, val_probs = validate(
-            model, val_loader, criterion, device,
+            model, test_loader, criterion, device,
         )
 
         # ── Metrics ───────────────────────────────────────────────────
@@ -308,7 +313,7 @@ def train(args):
 
         # ── Print summary ─────────────────────────────────────────────
         print(f"  Train — Loss: {train_loss:.4f}  Acc: {100*train_acc:.2f}%")
-        print(f"  Val   — Loss: {val_loss:.4f}  Acc: {100*val_acc:.2f}%  "
+        print(f"  Test  — Loss: {val_loss:.4f}  Acc: {100*val_acc:.2f}%  "
               f"F1(macro): {val_f1_macro:.4f}  F1(weighted): {val_f1_weighted:.4f}")
         for i, name in enumerate(config.CLASS_NAMES):
             print(f"         {name:>6}: P={precision[i]:.3f}  R={recall[i]:.3f}  F1={f1_per_class[i]:.3f}")

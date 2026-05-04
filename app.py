@@ -285,11 +285,6 @@ def build_ui():
     """Build the Gradio interface."""
     with gr.Blocks(
         title="StegoDetect — Steganography Detection & Payload Analysis",
-        css=CUSTOM_CSS,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="slate",
-        ),
     ) as demo:
         gr.Markdown("# 🔍 StegoDetect", elem_classes=["main-title"])
         gr.Markdown(
@@ -368,8 +363,13 @@ if __name__ == "__main__":
 
     demo = build_ui()
     demo.launch(
-        server_name="0.0.0.0",
+        server_name="127.0.0.1",
         server_port=7860,
         share=False,
         show_error=True,
+        theme=gr.themes.Soft(
+            primary_hue="blue",
+            secondary_hue="slate",
+        ),
+        css=CUSTOM_CSS,
     )

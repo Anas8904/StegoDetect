@@ -46,7 +46,6 @@ NLP_CORPUS_DIR = DATA_DIR / "nlp_corpus"
 CHECKPOINTS_DIR = PROJECT_ROOT / "checkpoints"
 MODULE1_CHECKPOINT_DIR = CHECKPOINTS_DIR / "module1"
 MODELS_DIR = PROJECT_ROOT / "models"
-CODEBERT_DIR = MODELS_DIR / "codebert"
 
 # Results
 RESULTS_DIR = PROJECT_ROOT / "results"
@@ -74,11 +73,11 @@ CNN_CONFIG = {
     "batch_size": 32,
     "num_workers": 4,
 
-    # Phase 1 (frozen backbone, epochs 1-10)
-    "phase1_epochs": 10,
+    # Phase 1 (frozen backbone, epochs 1-2)
+    "phase1_epochs": 2,
     "phase1_lr": 1e-3,
 
-    # Phase 2 (unfrozen, epochs 11-50)
+    # Phase 2 (unfrozen, epochs 3-50)
     "phase2_lr_backbone": 1e-4,
     "phase2_lr_classifier": 1e-3,
 
@@ -99,11 +98,6 @@ NLP_CONFIG = {
     "tfidf_max_features": 100000,
     "tfidf_ngram_range": (1, 4),
     "svm_C": 1.0,
-    "codebert_model_name": "microsoft/codebert-base",
-    "codebert_max_length": 512,
-    "codebert_batch_size": 8,
-    "codebert_epochs": 5,
-    "codebert_lr": 2e-5,
 }
 
 # NLP class labels
@@ -134,7 +128,6 @@ ALL_DIRS = [
     CHECKPOINTS_DIR,
     MODULE1_CHECKPOINT_DIR,
     MODELS_DIR,
-    CODEBERT_DIR,
     RESULTS_DIR,
     REPORTS_DIR,
 ]

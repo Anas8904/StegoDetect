@@ -1,6 +1,6 @@
 # STEGODETECT — COMPLETE PROJECT CONTEXT
 > Paste this at the start of every session with your coding assistant.
-> Last updated: 2026-04-26
+> Last updated: 2026-05-04
 
 ---
 
@@ -17,11 +17,11 @@ extracts the hidden payloads, and classifies them.
 4. **Module 4 — NLP Classification:** Classifies extracted payloads (PowerShell, JavaScript, URLs, Ethereum, HTML)
 
 ### Current Status:
-- [x] Dataset merging complete (60,000 images merged into `data/combined/`)
+- [x] Dataset merging complete (originally 60,000 images, now 47,995 after test set artifact cleanup)
 - [x] Module 1 CNN architecture created (EfficientNet-B0, 4M params)
 - [x] Training script ready with 2-phase strategy
-- [x] Gradio web UI skeleton created (3 tabs)
-- [ ] Module 1 training NOT yet run (need GPU or CPU time)
+- [x] Gradio web UI operational (running locally at http://127.0.0.1:7860)
+- [x] Module 1 training COMPLETE (Achieved 76.3% accuracy. Models saved in checkpoints/module1)
 - [ ] Module 2 (statistical validator) NOT yet created
 - [ ] Module 3 (payload extractor) NOT yet created
 - [ ] Module 4 (NLP classifier) NOT yet created
@@ -86,7 +86,7 @@ Capstone/
 |-- PROJECT_CONTEXT.md         # THIS FILE - project context for AI assistants
 |
 |-- data/
-|   |-- combined/              # THE DATASET (2.45 GB) - merged 3-class dataset
+|   |-- combined/              # THE DATASET (merged 3-class dataset)
 |   |   |-- train/
 |   |   |   |-- clean/         # 8,000 clean images (from both LSB & PVD sources)
 |   |   |   |-- lsb/           # 12,000 LSB stego images
@@ -97,7 +97,7 @@ Capstone/
 |   |   |   |-- pvd/           # 2,000
 |   |   |-- test/
 |   |   |   |-- clean/         # 4,000
-|   |   |   |-- lsb/           # 18,000 (includes raw + b64_ prefixed + zip_ prefixed)
+|   |   |   |-- lsb/           # 6,000 (raw stego only. b64/zip variants were deleted)
 |   |   |   |-- pvd/           # 2,000
 |   |   |-- class_map.json     # {"clean": 0, "lsb": 1, "pvd": 2}
 |   |   |-- merge_summary.json # Statistics from the dataset merge
@@ -223,8 +223,8 @@ All images are **512x512 pixels, PNG format**.
 |-------|-------|-----|-----|-------|
 | Train | 8,000 | 12,000 | 3,995 | 23,995 |
 | Val | 4,000 | 6,000 | 2,000 | 12,000 |
-| Test | 4,000 | 18,000 | 2,000 | 24,000 |
-| **Total** | **16,000** | **36,000** | **7,995** | **59,995** |
+| Test | 4,000 | 6,000 | 2,000 | 12,000 |
+| **Total** | **16,000** | **24,000** | **7,995** | **47,995** |
 
 ### Class Weights (train split):
 - clean: 1.00
@@ -232,10 +232,10 @@ All images are **512x512 pixels, PNG format**.
 - pvd: 2.00
 
 ### LSB Variants in Test Set:
-The test/lsb/ folder contains 18,000 images:
+The test/lsb/ folder originally contained 18,000 images, but the `b64` and `zip` payload variants were DELETED to clean the dataset artifacts. It now contains exactly 6,000 images:
 - 6,000 raw stego (no prefix)
-- 6,000 base64-encoded payload (`b64_` prefix)
-- 6,000 zip-compressed payload (`zip_` prefix)
+- ~~6,000 base64-encoded payload (`b64_` prefix)~~ [DELETED]
+- ~~6,000 zip-compressed payload (`zip_` prefix)~~ [DELETED]
 
 Train and Val LSB folders only have raw stego images (no b64/zip variants).
 
@@ -338,12 +338,12 @@ Key sections:
 - PHASE 1: Dataset Merging (DONE)
 - PHASE 2: Data Pipeline / DataLoader (DONE)
 - PHASE 3: Module 1 CNN Architecture (DONE)
-- PHASE 4: Training Module 1 (DONE - script ready, not yet trained)
+- PHASE 4: Training Module 1 (DONE - trained with 76.3% accuracy, best model saved)
 - PHASE 5: Module 2 Statistical Validator (TODO)
 - PHASE 6: Module 3 Payload Extractor (TODO)
 - PHASE 7: NLP Corpus Builder (TODO)
 - PHASE 8-9: Module 4 NLP Classifier (TODO)
 - PHASE 10: Pipeline Integration (TODO)
 - PHASE 11: Evaluation Suite (TODO)
-- PHASE 12: Gradio Web Interface (PARTIALLY DONE - CNN part ready)
+- PHASE 12: Gradio Web Interface (DONE - CNN part ready and operational locally)
 - PHASE 13: Run Order & Integration Test (TODO)

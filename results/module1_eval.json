@@ -1,0 +1,9 @@
+{
+    "test_accuracy": 0.7707083333333333,
+    "test_loss": 0.39370782788474323,
+    "best_epoch": 28,
+    "best_val_f1": 0.7788628309217266,
+    "classification_report": "              precision    recall  f1-score   support\n\n       clean     0.4252    0.9760    0.5923      4000\n         lsb     1.0000    0.7062    0.8278     18000\n         pvd     0.8932    0.9410    0.9165      2000\n\n    accuracy                         0.7707     24000\n   macro avg     0.7728    0.8744    0.7789     24000\nweighted avg     0.8953    0.7707    0.7959     24000\n",
+    "clean_fpr": 0.024,
+    "timestamp": "2026-05-03T22:12:04.758744"
+}
