@@ -1,12 +1,3 @@
-"""
-StegoDetect — Gradio Web Interface
-Steganography Detection & Payload Analysis
-
-Tab 1: Analyze Image  — Upload a single image, get detection results
-Tab 2: Batch Analysis  — Upload multiple images for bulk analysis
-Tab 3: About           — Project information
-"""
-
 import os
 import sys
 import json
@@ -14,6 +5,7 @@ import time
 import tempfile
 from pathlib import Path
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -32,26 +24,62 @@ from modules.dataset import get_transforms
 PIPELINE_LOADED = False
 MODEL = None
 TRANSFORM = None
+DECISION_THRESHOLDS = None   # calibrated thresholds from training
+
+
+def _add_noise_residual(image_tensor: torch.Tensor, pil_image: Image.Image) -> torch.Tensor:
+    """
+    Add Laplacian noise-residual as 4th channel, matching dataset.py logic.
+
+    This is required when the model was trained with use_noise_residual=True.
+    """
+    img_np = np.array(pil_image)
+    gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+    laplacian = cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F)
+
+    lap_min, lap_max = laplacian.min(), laplacian.max()
+    if lap_max - lap_min > 0:
+        laplacian_norm = (laplacian - lap_min) / (lap_max - lap_min)
+    else:
+        laplacian_norm = np.zeros_like(laplacian)
+
+    size = config.CNN_CONFIG["input_size"]
+    laplacian_resized = cv2.resize(laplacian_norm, (size, size))
+    noise_channel = torch.tensor(laplacian_resized, dtype=torch.float32).unsqueeze(0)
+    return torch.cat([image_tensor, noise_channel], dim=0)
 
 
 def load_models():
-    """Load the CNN model checkpoint."""
-    global PIPELINE_LOADED, MODEL, TRANSFORM
+    """Load the CNN model checkpoint and decision thresholds."""
+    global PIPELINE_LOADED, MODEL, TRANSFORM, DECISION_THRESHOLDS
 
     checkpoint_path = config.MODULE1_CHECKPOINT_DIR / "best_model.pth"
     if not checkpoint_path.exists():
-        print(f"⚠  Model not found at {checkpoint_path}")
+        print(f"[WARN] Model not found at {checkpoint_path}")
         print("   Run training first: python training/train_module1.py")
         return False
 
     try:
         MODEL = load_pretrained_stego(str(checkpoint_path), device=config.DEVICE)
         TRANSFORM = get_transforms("test")
+
+        # Load calibrated thresholds if available
+        thresh_path = config.MODULE1_CHECKPOINT_DIR / "decision_thresholds.json"
+        if thresh_path.exists():
+            with open(thresh_path) as f:
+                raw = json.load(f)
+            # Keys are stored as strings in JSON — convert back to int
+            DECISION_THRESHOLDS = {int(k): v for k, v in raw.items()}
+            print(f"[OK] Decision thresholds loaded: {DECISION_THRESHOLDS}")
+        else:
+            DECISION_THRESHOLDS = None
+            print("[INFO] No decision thresholds found — using argmax.")
+
         PIPELINE_LOADED = True
-        print("✓ Models loaded successfully!")
+        print("[OK] Models loaded successfully!")
         return True
     except Exception as e:
-        print(f"✗ Failed to load models: {e}")
+        print(f"[FAIL] Failed to load models: {e}")
         return False
 
 
@@ -95,8 +123,14 @@ def analyze_single_image(image, show_technical):
             return ("⚠️ Image must be at least 100×100 pixels", "", "", "", None)
 
         # Transform and predict
-        input_tensor = TRANSFORM(pil_image).unsqueeze(0).to(config.DEVICE)
-        pred_class, confidence, probs = MODEL.predict_with_confidence(input_tensor)
+        input_tensor = TRANSFORM(pil_image)
+        # Add noise-residual 4th channel if the model was trained with it
+        if MODEL.use_noise_residual:
+            input_tensor = _add_noise_residual(input_tensor, pil_image)
+        input_tensor = input_tensor.unsqueeze(0).to(config.DEVICE)
+        pred_class, confidence, probs = MODEL.predict_with_confidence(
+            input_tensor, thresholds=DECISION_THRESHOLDS,
+        )
 
         pred_idx = pred_class.item()
         conf = confidence.item()
@@ -178,8 +212,13 @@ def analyze_batch(files):
     for file_obj in files:
         try:
             img = Image.open(file_obj.name).convert("RGB")
-            input_tensor = TRANSFORM(img).unsqueeze(0).to(config.DEVICE)
-            pred_class, confidence, probs = MODEL.predict_with_confidence(input_tensor)
+            input_tensor = TRANSFORM(img)
+            if MODEL.use_noise_residual:
+                input_tensor = _add_noise_residual(input_tensor, img)
+            input_tensor = input_tensor.unsqueeze(0).to(config.DEVICE)
+            pred_class, confidence, probs = MODEL.predict_with_confidence(
+                input_tensor, thresholds=DECISION_THRESHOLDS,
+            )
 
             pred_idx = pred_class.item()
             conf = confidence.item()
