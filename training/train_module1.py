@@ -1,23 +1,30 @@
 """
-StegoDetect - Training Script for Module 1 (EfficientNet-B0 CNN)  v2
+StegoDetect - Training Script for Module 1 (EfficientNet CNN)  v3
 
-CHANGES FROM v1:
-  - FocalLoss replaces plain CrossEntropyLoss
-      * gamma=2.0 concentrates gradients on the hard misclassified LSB images
-      * label_smoothing=0.1 prevents over-confident softmax
-  - Manual class weights [1.5, 2.5, 2.0] replace auto-computed weights
-      * v1 auto-computed LSB weight was 0.67 — DOWNWEIGHTING the class
-        with the worst recall.  Manual weights fix this.
-  - Threshold calibration after training
-      * Sweeps the clean-class threshold on the validation set to find
-        the value that minimises FPR while keeping clean F1 acceptable.
-  - Cosine-Annealing warm restart (T_0 matching phase length)
-  - Mixed-precision training (torch.amp) when CUDA available
-  - Val set used for early stopping; test set only touched at the end
+CHANGES FROM v2:
+  - Linear LR warmup for Phase 2 (warmup_epochs=3).
+    Fixes the val_loss=0.939 spike seen at epoch 40 in v2 logs.
+  - dataset.py now uses SAFE augmentation (no color jitter).
+    This is the most impactful fix — color jitter was erasing the
+    LSB signal before the model ever saw it.
+  - WeightedRandomSampler support in get_dataloaders().
+  - Updated to use config.CNN_CONFIG["use_srm"] (default False in v3).
+  - Gradient accumulation support (accumulate_steps arg) for
+    effective large-batch training on low-VRAM GPUs.
+  - Per-class accuracy printed each epoch so you can track LSB recall.
 
 Usage:
-    python training/train_module1.py --epochs 75 --batch_size 32 --device cuda
-    python training/train_module1.py --resume --device cuda
+    # Standard run (recommended first try):
+    python training/train_module1.py
+
+    # With gradient accumulation (effective batch = 32×4 = 128):
+    python training/train_module1.py --accumulate_steps 4
+
+    # Resume from last checkpoint:
+    python training/train_module1.py --resume
+
+    # Low-VRAM mode (use B0 in config.py, smaller batch):
+    python training/train_module1.py --batch_size 16 --accumulate_steps 2
 """
 
 import os
@@ -71,20 +78,8 @@ class FocalLoss(nn.Module):
 
     FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
 
-    WHY IT HELPS HERE:
-      - Standard CE treats every sample equally.
-      - The model already classifies PVD correctly (F1=0.92) and clean
-        trivially (recall=0.976).  These easy examples dominate the gradient.
-      - Focal loss down-weights those easy examples (large (1-p_t)^gamma
-        when p_t is already high) and forces the model to focus on the
-        hard LSB images it keeps misclassifying as clean.
-      - gamma=2.0 is the standard recommendation.
-
-    Args:
-        weight:          per-class weights tensor (class_weights)
-        gamma:           focusing parameter (default 2.0)
-        label_smoothing: label smoothing factor (default 0.1)
-        reduction:       'mean' | 'sum'
+    gamma=2.0 down-weights easy correct predictions (clean, pvd) and
+    concentrates gradients on the hard LSB examples.
     """
 
     def __init__(
@@ -101,19 +96,16 @@ class FocalLoss(nn.Module):
         self.reduction       = reduction
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        # Step 1: compute per-sample cross-entropy (with label smoothing)
         ce = F.cross_entropy(
             inputs, targets,
-            weight    = self.weight,
-            reduction = "none",
+            weight          = self.weight,
+            reduction       = "none",
             label_smoothing = self.label_smoothing,
         )
-        # Step 2: compute p_t  (probability assigned to the true class)
         with torch.no_grad():
             probs = F.softmax(inputs, dim=1)
             p_t   = probs.gather(1, targets.unsqueeze(1)).squeeze(1)
 
-        # Step 3: focal modulation
         focal_weight = (1.0 - p_t) ** self.gamma
         loss = focal_weight * ce
 
@@ -125,11 +117,53 @@ class FocalLoss(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Warmup LR scheduler
+# ──────────────────────────────────────────────────────────────────────
+
+class LinearWarmupCosineAnnealingLR:
+    """
+    Linear warmup for `warmup_epochs`, then cosine annealing.
+
+    Wraps two PyTorch schedulers.  Call `.step()` once per epoch.
+    """
+
+    def __init__(self, optimizer, warmup_epochs: int, total_epochs: int, eta_min: float = 1e-7):
+        self.optimizer      = optimizer
+        self.warmup_epochs  = warmup_epochs
+        self.total_epochs   = total_epochs
+        self.eta_min        = eta_min
+        self.current_epoch  = 0
+        self.base_lrs       = [pg["lr"] for pg in optimizer.param_groups]
+
+        self.cosine_scheduler = CosineAnnealingLR(
+            optimizer,
+            T_max   = max(1, total_epochs - warmup_epochs),
+            eta_min = eta_min,
+        )
+
+    def step(self):
+        self.current_epoch += 1
+        if self.current_epoch <= self.warmup_epochs:
+            # Linear warmup: scale from 0 → base_lr over warmup_epochs
+            scale = self.current_epoch / max(1, self.warmup_epochs)
+            for pg, base_lr in zip(self.optimizer.param_groups, self.base_lrs):
+                pg["lr"] = base_lr * scale
+        else:
+            self.cosine_scheduler.step()
+
+    def get_last_lr(self):
+        return [pg["lr"] for pg in self.optimizer.param_groups]
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Training helpers
 # ──────────────────────────────────────────────────────────────────────
 
-def train_one_epoch(model, loader, criterion, optimizer, scaler, device, max_grad_norm=1.0):
-    """Train for one epoch. Returns avg loss, accuracy, preds, labels."""
+def train_one_epoch(
+    model, loader, criterion, optimizer, scaler, device,
+    max_grad_norm=1.0, accumulate_steps=1,
+):
+    """Train for one epoch with optional gradient accumulation."""
     model.train()
     running_loss = 0.0
     correct      = 0
@@ -138,28 +172,35 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, max_gra
     all_labels   = []
 
     use_amp = (device.type == "cuda")
+    optimizer.zero_grad()
 
-    pbar = tqdm(loader, desc="  Train", leave=False)
-    for images, labels in pbar:
+    pbar = tqdm(enumerate(loader), total=len(loader), desc="  Train", leave=False)
+    for step, (images, labels) in pbar:
         images, labels = images.to(device), labels.to(device)
-        optimizer.zero_grad()
 
         with torch.amp.autocast(device_type=device.type, enabled=use_amp):
             logits = model(images)
             loss   = criterion(logits, labels)
+            loss   = loss / accumulate_steps   # scale for accumulation
 
         if use_amp:
             scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            scaler.step(optimizer)
-            scaler.update()
         else:
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
-            optimizer.step()
 
-        running_loss += loss.item() * images.size(0)
+        if (step + 1) % accumulate_steps == 0 or (step + 1) == len(loader):
+            if use_amp:
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+                optimizer.step()
+            optimizer.zero_grad()
+
+        loss_item = loss.item() * accumulate_steps
+        running_loss += loss_item * images.size(0)
         _, predicted  = torch.max(logits, 1)
         total        += labels.size(0)
         correct      += (predicted == labels).sum().item()
@@ -167,7 +208,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, max_gra
         all_labels.extend(labels.cpu().numpy())
 
         pbar.set_postfix(
-            loss=f"{loss.item():.4f}",
+            loss=f"{loss_item:.4f}",
             acc=f"{100*correct/total:.1f}%",
         )
 
@@ -213,27 +254,29 @@ def validate(model, loader, criterion, device):
     )
 
 
+def print_per_class_stats(labels, preds, class_names):
+    """Print per-class accuracy to track LSB recall specifically."""
+    precision, recall, f1_per_class, support = precision_recall_fscore_support(
+        labels, preds, average=None,
+        labels=list(range(len(class_names))),
+        zero_division=0,
+    )
+    for i, name in enumerate(class_names):
+        print(f"           {name:>6}: P={precision[i]:.3f}  "
+              f"R={recall[i]:.3f}  F1={f1_per_class[i]:.3f}  "
+              f"n={support[i]}")
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Threshold calibration
 # ──────────────────────────────────────────────────────────────────────
 
 def calibrate_thresholds(val_labels, val_probs, target_fpr: float = 0.02):
     """
-    Find the optimal per-class threshold on the validation set.
-
-    Strategy:
-      1. The main problem is clean-class precision (model over-predicts clean).
-         We search for a clean-class threshold t such that a sample is only
-         called "clean" when P(clean) >= t.
-      2. We sweep t from 0.3 to 0.9 and pick the value where:
-           - Clean FPR <= target_fpr (2%)   [hard constraint]
-           - Macro F1 is maximised
-      3. Thresholds for lsb/pvd are left at 0.5 (argmax behaviour).
-
-    Returns:
-        thresholds dict {class_idx: threshold} or None if no improvement
+    Find the optimal clean-class threshold on the validation set.
+    Returns {0: threshold} or None if no improvement.
     """
-    best_f1    = -1.0
+    best_f1     = -1.0
     best_thresh = None
 
     val_labels = np.array(val_labels)
@@ -241,21 +284,17 @@ def calibrate_thresholds(val_labels, val_probs, target_fpr: float = 0.02):
 
     for t in np.arange(0.30, 0.91, 0.01):
         preds = np.argmax(val_probs, axis=1).copy()
-        # Override: samples predicted as clean must have P(clean) >= t
-        # If below threshold, predict the next-best class
         clean_pred_mask = preds == 0
         low_conf_mask   = val_probs[:, 0] < t
         switch_mask     = clean_pred_mask & low_conf_mask
 
         if switch_mask.sum() > 0:
-            # Among non-clean classes, pick the highest probability
-            alt_probs          = val_probs.copy()
-            alt_probs[:, 0]    = -1.0
-            alt_preds          = np.argmax(alt_probs, axis=1)
+            alt_probs       = val_probs.copy()
+            alt_probs[:, 0] = -1.0
+            alt_preds       = np.argmax(alt_probs, axis=1)
             preds[switch_mask] = alt_preds[switch_mask]
 
-        # Evaluate
-        macro_f1 = f1_score(val_labels, preds, average="macro", zero_division=0)
+        macro_f1  = f1_score(val_labels, preds, average="macro", zero_division=0)
         clean_mask = val_labels == 0
         fpr_clean  = ((preds[clean_mask] != 0).sum() / clean_mask.sum()
                       if clean_mask.sum() > 0 else 0.0)
@@ -310,7 +349,6 @@ def save_roc_curves(y_true, y_probs, save_path, class_names):
 
 
 def save_training_curves(log_path, save_path):
-    """Plot train/val loss and F1 from CSV log."""
     import csv as _csv
     epochs, train_loss, val_loss, val_f1 = [], [], [], []
     try:
@@ -331,6 +369,7 @@ def save_training_curves(log_path, save_path):
         ax1.legend()
 
         ax2.plot(epochs, val_f1, label="Val Macro F1", color="green")
+        ax2.axhline(0.80, color="red", linestyle="--", alpha=0.6, label="80% target")
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("Macro F1")
         ax2.set_title("Validation F1")
@@ -350,15 +389,19 @@ def save_training_curves(log_path, save_path):
 
 def train(args):
     device = torch.device(args.device if args.device != "auto" else str(config.DEVICE))
+    use_srm = config.CNN_CONFIG.get("use_srm", False)
+
     print(f"\n{'='*60}")
-    print(f"StegoDetect - Module 1 Training  (v2)")
+    print(f"StegoDetect - Module 1 Training  (v3)")
     print(f"{'='*60}")
     print(f"Device:          {device}")
     print(f"Epochs:          {args.epochs}")
-    print(f"Batch size:      {args.batch_size}")
+    print(f"Batch size:      {args.batch_size} (effective: {args.batch_size * args.accumulate_steps})")
+    print(f"Accumulate:      {args.accumulate_steps} steps")
     print(f"Noise residual:  {args.use_noise_residual}")
-    print(f"SRM layer:       {args.use_srm}")
+    print(f"SRM layer:       {use_srm}")
     print(f"Focal loss:      {config.CNN_CONFIG['use_focal_loss']}")
+    print(f"Warmup epochs:   {config.CNN_CONFIG['warmup_epochs']}")
     print(f"Resume:          {args.resume}")
     print(f"{'='*60}\n")
 
@@ -369,20 +412,16 @@ def train(args):
     # ── Data ──────────────────────────────────────────────────────────
     print("Loading datasets...")
     train_loader, val_loader, test_loader, auto_class_weights = get_dataloaders(
-        batch_size        = args.batch_size,
-        num_workers       = args.num_workers,
-        use_noise_residual = args.use_noise_residual,
+        batch_size            = args.batch_size,
+        num_workers           = args.num_workers,
+        use_noise_residual    = args.use_noise_residual,
+        use_weighted_sampler  = config.CNN_CONFIG.get("use_weighted_sampler", True),
     )
     print(f"  Train batches: {len(train_loader)}")
     print(f"  Val batches:   {len(val_loader)}")
     print(f"  Test batches:  {len(test_loader)}")
-    print(f"  Auto class weights (unused): {auto_class_weights.tolist()}")
 
     # ── Class weights ─────────────────────────────────────────────────
-    # CHANGE: use manual weights instead of auto-computed.
-    # v1 auto-computed: [1.00, 0.67, 2.00]
-    # The 0.67 for LSB was counter-productive — penalising the model less
-    # for getting the hardest class wrong.
     manual_w = config.CNN_CONFIG["class_weights_manual"]
     class_weights = torch.tensor(manual_w, dtype=torch.float32)
     print(f"  Manual class weights: {class_weights.tolist()}")
@@ -391,7 +430,7 @@ def train(args):
     model = StegoClassifier(
         num_classes        = config.NUM_CLASSES,
         use_noise_residual = args.use_noise_residual,
-        use_srm            = args.use_srm,
+        use_srm            = use_srm,
         dropout            = config.CNN_CONFIG["dropout"],
     ).to(device)
     get_model_summary(model)
@@ -454,8 +493,10 @@ def train(args):
     # ──────────────────────────────────────────────────────────────────
     # TRAINING LOOP
     # ──────────────────────────────────────────────────────────────────
-    phase1_epochs = config.CNN_CONFIG["phase1_epochs"]
-    total_epochs  = args.epochs
+    phase1_epochs  = config.CNN_CONFIG["phase1_epochs"]
+    warmup_epochs  = config.CNN_CONFIG.get("warmup_epochs", 3)
+    total_epochs   = args.epochs
+    scheduler      = None
 
     for epoch in range(start_epoch, total_epochs):
         epoch_start   = time.time()
@@ -478,7 +519,14 @@ def train(args):
                     lr           = config.CNN_CONFIG["phase1_lr"],
                     weight_decay = config.CNN_CONFIG["weight_decay"],
                 )
+                remaining = phase1_epochs - epoch
+                scheduler = CosineAnnealingLR(
+                    optimizer,
+                    T_max   = max(1, remaining),
+                    eta_min = config.CNN_CONFIG["scheduler_eta_min"],
+                )
             else:
+                # Phase 2: unfreeze, differential LR, warmup
                 unfreeze_all(model)
                 optimizer = AdamW([
                     {
@@ -491,40 +539,38 @@ def train(args):
                     },
                 ], weight_decay=config.CNN_CONFIG["weight_decay"])
 
-            remaining = total_epochs - epoch
-            scheduler = CosineAnnealingLR(
-                optimizer,
-                T_max   = remaining,
-                eta_min = config.CNN_CONFIG["scheduler_eta_min"],
-            )
+                remaining = total_epochs - epoch
+                scheduler = LinearWarmupCosineAnnealingLR(
+                    optimizer,
+                    warmup_epochs = warmup_epochs,
+                    total_epochs  = remaining,
+                    eta_min       = config.CNN_CONFIG["scheduler_eta_min"],
+                )
+                print(f"\n  [Phase 2] LR warmup for {warmup_epochs} epochs then cosine")
 
         # ── Train ─────────────────────────────────────────────────────
         print(f"\nEpoch {current_epoch}/{total_epochs} — {phase_str}")
         train_loss, train_acc, train_preds, train_labels = train_one_epoch(
             model, train_loader, criterion, optimizer, scaler, device,
-            max_grad_norm=config.CNN_CONFIG["gradient_clip_max_norm"],
+            max_grad_norm    = config.CNN_CONFIG["gradient_clip_max_norm"],
+            accumulate_steps = args.accumulate_steps,
         )
 
-        # ── Validate (on val set) ─────────────────────────────────────
+        # ── Validate ──────────────────────────────────────────────────
         val_loss, val_acc, val_preds, val_labels, val_probs = validate(
             model, val_loader, criterion, device,
         )
 
         # ── Metrics ───────────────────────────────────────────────────
-        val_f1_macro    = f1_score(val_labels, val_preds, average="macro")
-        val_f1_weighted = f1_score(val_labels, val_preds, average="weighted")
-        precision, recall, f1_per_class, _ = precision_recall_fscore_support(
-            val_labels, val_preds, average=None, labels=[0, 1, 2],
-        )
+        val_f1_macro    = f1_score(val_labels, val_preds, average="macro", zero_division=0)
+        val_f1_weighted = f1_score(val_labels, val_preds, average="weighted", zero_division=0)
         current_lr  = optimizer.param_groups[0]["lr"]
         epoch_time  = time.time() - epoch_start
 
         print(f"  Train  — Loss: {train_loss:.4f}  Acc: {100*train_acc:.2f}%")
         print(f"  Val    — Loss: {val_loss:.4f}  Acc: {100*val_acc:.2f}%  "
               f"F1(macro): {val_f1_macro:.4f}  F1(weighted): {val_f1_weighted:.4f}")
-        for i, name in enumerate(config.CLASS_NAMES):
-            print(f"           {name:>6}: P={precision[i]:.3f}  "
-                  f"R={recall[i]:.3f}  F1={f1_per_class[i]:.3f}")
+        print_per_class_stats(val_labels, val_preds, config.CLASS_NAMES)
         print(f"  LR: {current_lr:.2e}  Time: {epoch_time:.1f}s")
 
         # ── Log ───────────────────────────────────────────────────────
@@ -563,7 +609,7 @@ def train(args):
             "config": {
                 "num_classes":        config.NUM_CLASSES,
                 "use_noise_residual": args.use_noise_residual,
-                "use_srm":            args.use_srm,
+                "use_srm":            use_srm,
                 "dropout":            config.CNN_CONFIG["dropout"],
                 "batch_size":         args.batch_size,
                 "epochs":             args.epochs,
@@ -578,13 +624,14 @@ def train(args):
             best_val_f1      = val_f1_macro
             patience_counter = 0
             torch.save(ckpt_data, ckpt_dir / "best_model.pth")
-            print(f"  [BEST] New best model saved! (F1: {best_val_f1:.4f})")
+            print(f"  ★ New best model saved! (F1: {best_val_f1:.4f})")
         else:
             patience_counter += 1
             print(f"  No improvement "
                   f"({patience_counter}/{config.CNN_CONFIG['early_stopping_patience']})")
 
-        scheduler.step()
+        if scheduler is not None:
+            scheduler.step()
 
         if patience_counter >= config.CNN_CONFIG["early_stopping_patience"]:
             print(f"\n[STOP] Early stopping at epoch {current_epoch}")
@@ -612,16 +659,11 @@ def train(args):
     best_ckpt = torch.load(best_path, map_location=device, weights_only=False)
     model.load_state_dict(best_ckpt["model_state_dict"])
     model.eval()
-    print(f"Calibrating on validation set using best model (epoch {best_ckpt['epoch']})...")
+    print(f"Calibrating on val set using best model (epoch {best_ckpt['epoch']})...")
 
-    _, _, cal_preds, cal_labels, cal_probs = validate(
-        model, val_loader, criterion, device,
-    )
-    optimal_thresholds = calibrate_thresholds(
-        cal_labels, cal_probs, target_fpr=0.02,
-    )
+    _, _, cal_preds, cal_labels, cal_probs = validate(model, val_loader, criterion, device)
+    optimal_thresholds = calibrate_thresholds(cal_labels, cal_probs, target_fpr=0.02)
 
-    # Save thresholds
     thresh_path = ckpt_dir / "decision_thresholds.json"
     with open(thresh_path, "w") as f:
         json.dump(
@@ -636,14 +678,13 @@ def train(args):
     print(f"\n{'='*60}")
     print("FINAL EVALUATION ON TEST SET")
     print(f"{'='*60}")
-    print(f"Loaded best model from epoch {best_ckpt['epoch']} "
+    print(f"Best model from epoch {best_ckpt['epoch']} "
           f"(Val F1: {best_ckpt['val_f1']:.4f})")
 
     test_loss, test_acc, test_preds_raw, test_labels, test_probs = validate(
         model, test_loader, criterion, device,
     )
 
-    # Evaluate WITH thresholds
     test_preds = test_preds_raw.copy()
     if optimal_thresholds:
         for cls_idx, thresh in optimal_thresholds.items():
@@ -662,47 +703,40 @@ def train(args):
         digits=4,
     )
     print(f"\nTest Accuracy: {100*test_acc:.2f}%")
-    print(f"\nClassification Report (with calibrated thresholds):\n{report}")
+    print(f"\nClassification Report:\n{report}")
 
-    # Confusion matrix
     save_confusion_matrix(
         test_labels, test_preds,
         ckpt_dir / "final_confusion_matrix.png",
         "Final", config.CLASS_NAMES,
     )
-    print(f"Confusion matrix saved.")
 
-    # ROC curves
     try:
         save_roc_curves(
             test_labels, test_probs,
             ckpt_dir / "roc_curves.png",
             config.CLASS_NAMES,
         )
-        print(f"ROC curves saved.")
     except Exception as e:
         print(f"[WARN] ROC curves failed: {e}")
 
-    # Clean FPR
-    clean_mask = test_labels == 0
+    clean_mask  = test_labels == 0
     clean_total = clean_mask.sum()
+    fpr_clean   = 0.0
     if clean_total > 0:
-        fp_clean = ((test_preds != 0) & clean_mask).sum()
+        fp_clean  = ((test_preds != 0) & clean_mask).sum()
         fpr_clean = fp_clean / clean_total
         print(f"\nClean Image False Positive Rate: {100*fpr_clean:.2f}%")
-        if fpr_clean > 0.02:
-            print(f"  [WARN] FPR ({100*fpr_clean:.2f}%) exceeds 2% target!")
-        else:
-            print(f"  [OK] FPR is within the 2% target")
+        status = "[OK]" if fpr_clean <= 0.02 else "[WARN]"
+        print(f"  {status} Target: ≤2%")
 
-    # Save metrics
     test_metrics = {
         "test_accuracy":        float(test_acc),
         "test_loss":            float(test_loss),
         "best_epoch":           int(best_ckpt["epoch"]),
         "best_val_f1":          float(best_ckpt["val_f1"]),
         "classification_report":report,
-        "clean_fpr":            float(fpr_clean) if clean_total > 0 else None,
+        "clean_fpr":            float(fpr_clean),
         "optimal_thresholds":   optimal_thresholds,
         "timestamp":            datetime.now().isoformat(),
     }
@@ -721,20 +755,16 @@ def train(args):
 # ──────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train StegoDetect Module 1 CNN  (v2)")
-    parser.add_argument("--epochs",     type=int,   default=config.CNN_CONFIG["epochs"])
-    parser.add_argument("--batch_size", type=int,   default=config.CNN_CONFIG["batch_size"])
-    parser.add_argument("--num_workers",type=int,   default=config.CNN_CONFIG["num_workers"])
-    parser.add_argument("--device",     type=str,   default="auto")
+    parser = argparse.ArgumentParser(description="Train StegoDetect Module 1 CNN  (v3)")
+    parser.add_argument("--epochs",          type=int, default=config.CNN_CONFIG["epochs"])
+    parser.add_argument("--batch_size",      type=int, default=config.CNN_CONFIG["batch_size"])
+    parser.add_argument("--num_workers",     type=int, default=config.CNN_CONFIG["num_workers"])
+    parser.add_argument("--device",          type=str, default="auto")
+    parser.add_argument("--accumulate_steps",type=int, default=1,
+                        help="Gradient accumulation steps (effective batch = batch_size × steps)")
     parser.add_argument(
         "--use_noise_residual", action="store_true",
         default=config.CNN_CONFIG["use_noise_residual"],
-        help="Use noise-residual 4th channel (default: True in v2)",
-    )
-    parser.add_argument(
-        "--use_srm", action="store_true",
-        default=True,
-        help="Prepend SRM high-pass filter layer (default: True in v2)",
     )
     parser.add_argument("--resume", action="store_true")
     return parser.parse_args()

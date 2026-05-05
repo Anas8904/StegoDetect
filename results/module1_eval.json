@@ -1,9 +1,10 @@
 {
-    "test_accuracy": 0.7707083333333333,
-    "test_loss": 0.39370782788474323,
-    "best_epoch": 28,
-    "best_val_f1": 0.7788628309217266,
-    "classification_report": "              precision    recall  f1-score   support\n\n       clean     0.4252    0.9760    0.5923      4000\n         lsb     1.0000    0.7062    0.8278     18000\n         pvd     0.8932    0.9410    0.9165      2000\n\n    accuracy                         0.7707     24000\n   macro avg     0.7728    0.8744    0.7789     24000\nweighted avg     0.8953    0.7707    0.7959     24000\n",
-    "clean_fpr": 0.024,
-    "timestamp": "2026-05-03T22:12:04.758744"
+    "test_accuracy": 0.6731666666666667,
+    "test_loss": 0.4175078605017431,
+    "best_epoch": 43,
+    "best_val_f1": 0.6668278860782819,
+    "classification_report": "              precision    recall  f1-score   support\n\n       clean     0.2608    0.4105    0.3189      4000\n         lsb     0.8442    0.7132    0.7732     18000\n         pvd     0.6717    0.8380    0.7457      2000\n\n    accuracy                         0.6732     24000\n   macro avg     0.5922    0.6539    0.6126     24000\nweighted avg     0.7326    0.6732    0.6952     24000\n",
+    "clean_fpr": 0.5895,
+    "optimal_thresholds": null,
+    "timestamp": "2026-05-05T05:10:23.207855"
 }

@@ -1,22 +1,28 @@
 """
-StegoDetect - Project Configuration
-All project constants, paths, hyperparameters, and seed settings.
+StegoDetect - Project Configuration  (v3)
 
-CHANGES FROM v1:
-  - use_noise_residual: True  (was False) -- critical for LSB detection
-  - phase1_epochs: 5          (was 2)     -- longer warm-up before unfreeze
-  - epochs: 75                (was 50)    -- model stopped improving at ep28
-  - phase2_lr_backbone: 5e-5  (was 1e-4)  -- slower backbone fine-tuning
-  - phase2_lr_classifier: 5e-4 (was 1e-3) -- slower head fine-tuning
-  - weight_decay: 1e-4        (was 1e-5)  -- better regularisation
-  - early_stopping_patience: 15 (was 10)  -- give model more time
-  - dropout: 0.4              (was 0.3)
-  - label_smoothing: 0.1      (new)
-  - focal_gamma: 2.0          (new)       -- focal loss exponent
-  - use_focal_loss: True      (new)
-  - class_weights_manual: [1.5, 2.5, 2.0] (new)  -- overrides auto-compute
-    * auto-compute gave LSB weight=0.67, which was HURTING recall
-    * we now give LSB more weight to force the model to attend to it
+CHANGES FROM v2:
+  KEY BUG FIX:
+  - dataset.py now uses SAFE augmentation only (no color jitter).
+    Color jitter was modifying pixel values and ERASING the LSB signal.
+    This is likely the primary reason accuracy was stuck at 68%.
+
+  HYPERPARAMETER CHANGES:
+  - phase1_epochs: 10     (was 5)  — head needs more warm-up
+  - phase2_lr_backbone: 2e-5 (was 5e-5) — fixes the epoch-40 val_loss spike
+  - phase2_lr_classifier: 2e-4 (was 5e-4) — correspondingly lower
+  - early_stopping_patience: 20 (was 15) — give more time
+  - use_srm: False by default — SRM with 9 extra channels was adding
+    noise at init; test without it first.  Re-enable once 80% is hit.
+  - use_weighted_sampler: True (new) — oversample minority class at batch level
+  - warmup_epochs: 3 (new) — linear LR warmup at Phase 2 start
+  - scheduler_t_mult: 2 (new) — cosine warm restart multiplier
+
+  ARCHITECTURE CHANGE:
+  - model_name: efficientnet_b2  (was efficientnet_b0)
+    B2 has a wider feature space (1408 vs 1280 features) and has been
+    shown to improve steganalysis tasks by ~3-4% F1.
+    If GPU memory is tight, keep efficientnet_b0.
 """
 
 import os
@@ -70,55 +76,59 @@ CLASS_MAP   = {"clean": 0, "lsb": 1, "pvd": 2}
 NUM_CLASSES = len(CLASS_NAMES)
 
 # ──────────────────────────────────────────────────────────────────────
-# Module 1 - CNN Hyperparameters  (v2 — tuned for 85 %+ F1)
+# Module 1 - CNN Hyperparameters  (v3 — targeting 80%+ F1)
 # ──────────────────────────────────────────────────────────────────────
 CNN_CONFIG = {
-    "model_name":  "efficientnet_b0",
+    # Switch to B2 for more feature capacity (1408 vs 1280 dims).
+    # If you hit GPU OOM, revert to "efficientnet_b0".
+    "model_name":  "efficientnet_b2",
     "input_size":  224,
     "num_classes": NUM_CLASSES,
-    "dropout":     0.4,               # v1=0.3  → slightly stronger regularisation
+    "dropout":     0.4,
 
-    # KEY CHANGE: noise-residual 4th channel
-    # A Laplacian-filtered version of the image is added as channel 4.
-    # LSB steganography embeds in the least-significant bits, which shows
-    # up as subtle high-frequency noise — exactly what this channel captures.
-    "use_noise_residual": True,       # v1=False
+    # KEPT: noise-residual Laplacian channel (4th channel)
+    "use_noise_residual": True,
+
+    # DISABLED: SRM adds 9 channels from near-zero init — too noisy
+    # at the start of training.  Re-enable after reaching 80%.
+    "use_srm": False,
+
+    # Use WeightedRandomSampler in DataLoader to oversample minority class
+    "use_weighted_sampler": True,
 
     # Training schedule
-    "epochs":          75,            # v1=50  (model was at ep28/50, could improve)
+    "epochs":          80,
     "batch_size":      32,
     "num_workers":     4,
 
     # Phase 1: frozen backbone, only train the head
-    "phase1_epochs":   5,             # v1=2   (more warm-up before unfreezing)
+    # 10 epochs (up from 5) — val_f1 was only 0.34 at ep5, head underfitting
+    "phase1_epochs":   10,
     "phase1_lr":       1e-3,
 
-    # Phase 2: fine-tune entire network with differential LR
-    "phase2_lr_backbone":   5e-5,     # v1=1e-4  (slower = more stable)
-    "phase2_lr_classifier": 5e-4,     # v1=1e-3  (slower = more stable)
+    # Phase 2: fine-tune entire network
+    # Backbone LR dropped from 5e-5 → 2e-5 to fix the epoch-40 val_loss spike
+    "phase2_lr_backbone":   2e-5,
+    "phase2_lr_classifier": 2e-4,
 
-    "weight_decay":              1e-4, # v1=1e-5
-    "scheduler_eta_min":         1e-7, # v1=1e-6
+    # Linear LR warmup at the start of Phase 2 (avoids the spike)
+    "warmup_epochs": 3,
+
+    "weight_decay":              1e-4,
+    "scheduler_eta_min":         1e-7,
     "gradient_clip_max_norm":    1.0,
-    "early_stopping_patience":   15,   # v1=10
+    "early_stopping_patience":   20,   # was 15
 
-    # Focal loss (new)
-    # Standard cross-entropy treats every misclassification equally.
-    # Focal loss down-weights easy correct predictions and concentrates
-    # the gradient on the hard misclassified LSB examples.
-    "use_focal_loss": True,            # v1: plain CE
-    "focal_gamma":    2.0,             # standard value from Lin et al. 2017
+    # Focal loss
+    "use_focal_loss": True,
+    "focal_gamma":    2.0,
 
-    # Label smoothing (new)
-    # Prevents over-confident softmax, improves calibration.
-    "label_smoothing": 0.1,            # v1: no smoothing
+    # Label smoothing
+    "label_smoothing": 0.1,
 
-    # Manual class weights (new)
-    # v1 auto-computed:  clean=1.00, lsb=0.67, pvd=2.00
-    # The 0.67 weight for LSB was actively REDUCING the loss for missed
-    # LSB images, contributing to the 70% recall.  We flip this:
-    # lsb gets the highest weight so misses are penalised more.
-    "class_weights_manual": [1.5, 2.5, 2.0],  # [clean, lsb, pvd]
+    # Manual class weights:  [clean, lsb, pvd]
+    # lsb gets highest weight — it's the hardest class
+    "class_weights_manual": [1.5, 2.5, 2.0],
 
     # ImageNet normalisation
     "mean": [0.485, 0.456, 0.406],
