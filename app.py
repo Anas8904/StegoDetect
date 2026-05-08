@@ -1,10 +1,10 @@
 """
-StegoDetect — Gradio Web Interface
-Steganography Detection & Payload Analysis
+StegoDetect - Gradio Web Interface
+AI-Powered Steganography Detection & Payload Analysis
 
-Tab 1: Analyze Image  — Upload a single image, get detection results
-Tab 2: Batch Analysis  — Upload multiple images for bulk analysis
-Tab 3: About           — Project information
+Tab 1: Analyze Image  - Full 4-module pipeline on single image
+Tab 2: Batch Analysis  - Bulk analysis of multiple images
+Tab 3: About           - Project documentation & architecture
 """
 
 import os
@@ -15,6 +15,7 @@ import tempfile
 from pathlib import Path
 
 import numpy as np
+import cv2
 import torch
 from PIL import Image
 import gradio as gr
@@ -24,221 +25,392 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import config
 from modules.module1_cnn import StegoClassifier, load_pretrained_stego
 from modules.dataset import get_transforms
+from modules.module2_validator import chi_square_lsb_test, ppdh_pvd_test, validate_and_route
+from modules.module3_extractor import extract_payload, ExtractionResult
+from modules.module4_nlp import PayloadClassifier, NLPResult, LABEL_NAMES
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Global state: load models on startup
+# Global state
 # ──────────────────────────────────────────────────────────────────────
 PIPELINE_LOADED = False
 MODEL = None
 TRANSFORM = None
+NLP_CLASSIFIER = None
 
 
 def load_models():
-    """Load the CNN model checkpoint."""
-    global PIPELINE_LOADED, MODEL, TRANSFORM
+    """Load CNN model and NLP classifier."""
+    global PIPELINE_LOADED, MODEL, TRANSFORM, NLP_CLASSIFIER
 
     checkpoint_path = config.MODULE1_CHECKPOINT_DIR / "best_model.pth"
     if not checkpoint_path.exists():
-        print(f"⚠  Model not found at {checkpoint_path}")
-        print("   Run training first: python training/train_module1.py")
+        print(f"[WARN] CNN model not found at {checkpoint_path}")
+        print("   Train first: python training/train_module1.py")
         return False
 
     try:
         MODEL = load_pretrained_stego(str(checkpoint_path), device=config.DEVICE)
         TRANSFORM = get_transforms("test")
+        NLP_CLASSIFIER = PayloadClassifier(use_codebert=False)
+        NLP_CLASSIFIER.load_all()
         PIPELINE_LOADED = True
-        print("✓ Models loaded successfully!")
+        print("[OK] All models loaded successfully!")
         return True
     except Exception as e:
-        print(f"✗ Failed to load models: {e}")
+        print(f"[FAIL] Failed to load models: {e}")
         return False
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Analysis functions
+# SRM Kernels for noise residual
 # ──────────────────────────────────────────────────────────────────────
+_SRM_K1 = np.array([[0,0,0,0,0],[0,0,0,0,0],[0,1,-2,1,0],[0,0,0,0,0],[0,0,0,0,0]], dtype=np.float64)
+_SRM_K2 = np.array([[0,0,0,0,0],[0,-1,2,-1,0],[0,2,-4,2,0],[0,-1,2,-1,0],[0,0,0,0,0]], dtype=np.float64)
+_SRM_K3 = np.array([[-1,2,-2,2,-1],[2,-6,8,-6,2],[-2,8,-12,8,-2],[2,-6,8,-6,2],[-1,2,-2,2,-1]], dtype=np.float64)
 
+
+def preprocess_image(pil_image):
+    image_tensor = TRANSFORM(pil_image)
+    if getattr(MODEL, "use_noise_residual", False):
+        size = config.CNN_CONFIG["input_size"]
+        img_resized = pil_image.resize((size, size), Image.BILINEAR)
+        img_np = np.array(img_resized, dtype=np.float64)
+        residuals = []
+        for kernel in [_SRM_K1, _SRM_K2, _SRM_K3]:
+            ch_res = [cv2.filter2D(img_np[:,:,c], cv2.CV_64F, kernel) for c in range(3)]
+            residuals.append(np.mean(ch_res, axis=0))
+        noise_map = np.clip(np.mean(residuals, axis=0) / 4.0, -3.0, 3.0)
+        noise_channel = torch.tensor(noise_map, dtype=torch.float32).unsqueeze(0)
+        image_tensor = torch.cat([image_tensor, noise_channel], dim=0)
+    return image_tensor.unsqueeze(0).to(config.DEVICE)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Risk mapping helper
+# ──────────────────────────────────────────────────────────────────────
+def compute_risk(technique, payload_category, confidence):
+    if technique == "clean":
+        return "None", "#10b981"
+    risk_map = {"PowerShell": "Critical", "JavaScript": "High",
+                "JavaScript_HTML": "High", "URL_IP": "Medium", "Ethereum_Address": "Medium"}
+    risk = risk_map.get(payload_category, "Medium") if payload_category else "Medium"
+    if confidence < 0.70:
+        downgrade = {"Critical": "High", "High": "Medium", "Medium": "Low"}
+        risk = downgrade.get(risk, risk)
+    colors = {"Critical": "#ef4444", "High": "#f97316", "Medium": "#eab308", "Low": "#3b82f6", "None": "#10b981"}
+    return risk, colors.get(risk, "#6b7280")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Single image analysis
+# ──────────────────────────────────────────────────────────────────────
 def analyze_single_image(image, show_technical):
-    """
-    Analyze a single image for steganography.
-
-    Returns formatted results for display in the Gradio UI.
-    """
     if image is None:
-        return (
-            "⚠️ Please upload an image",   # detection result
-            "",                              # risk level
-            "",                              # details
-            "",                              # technical details
-            None,                            # JSON report
-        )
+        return "Upload an image to begin analysis.", "", "", "", "", None
 
     if not PIPELINE_LOADED:
-        return (
-            "⚠️ Models not loaded. Run training first:\n  python training/train_module1.py",
-            "", "", "", None,
-        )
+        return ("[WARN] Models not loaded. Train first:\n"
+                "  python training/train_module1.py --epochs 50 --batch_size 16 --device cuda",
+                "", "", "", "", None)
 
     start_time = time.time()
-
     try:
-        # ── Preprocess ────────────────────────────────────────────────
-        if isinstance(image, np.ndarray):
-            pil_image = Image.fromarray(image).convert("RGB")
-        else:
-            pil_image = image.convert("RGB")
-
-        # Check minimum size
+        pil_image = Image.fromarray(image).convert("RGB") if isinstance(image, np.ndarray) else image.convert("RGB")
         w, h = pil_image.size
         if w < 100 or h < 100:
-            return ("⚠️ Image must be at least 100×100 pixels", "", "", "", None)
+            return "[WARN] Image must be at least 100x100 pixels.", "", "", "", "", None
 
-        # Transform and predict
-        input_tensor = TRANSFORM(pil_image).unsqueeze(0).to(config.DEVICE)
+        temp_path = Path(tempfile.gettempdir()) / "stegodetect_temp_input.png"
+        pil_image.save(str(temp_path), format="PNG")
+
+        # MODULE 1: CNN
+        input_tensor = preprocess_image(pil_image)
         pred_class, confidence, probs = MODEL.predict_with_confidence(input_tensor)
-
         pred_idx = pred_class.item()
         conf = confidence.item()
-        prob_dict = {
-            name: float(probs[0][i].item())
-            for i, name in enumerate(config.CLASS_NAMES)
-        }
-
-        processing_time = (time.time() - start_time) * 1000  # ms
-
-        # ── Format detection result ───────────────────────────────────
         class_name = config.CLASS_NAMES[pred_idx]
-        if class_name == "clean":
-            detection_text = f"✅ CLEAN — No steganography detected ({conf*100:.1f}% confidence)"
-            risk_level = "🟢 Risk Level: None"
-            details = "No hidden data was found in this image."
-        elif class_name == "lsb":
-            detection_text = f"🔴 LSB Steganography Detected — {conf*100:.1f}% confidence"
-            risk_level = "🟠 Risk Level: High"
-            details = (
-                f"**Technique:** LSB (Least Significant Bit)\n\n"
-                f"The CNN model has detected LSB steganography patterns in this image. "
-                f"Hidden data may be embedded in the least significant bits of pixel values."
-            )
-        else:  # pvd
-            detection_text = f"🔴 PVD Steganography Detected — {conf*100:.1f}% confidence"
-            risk_level = "🟠 Risk Level: High"
-            details = (
-                f"**Technique:** PVD (Pixel Value Differencing)\n\n"
-                f"The CNN model has detected PVD steganography patterns in this image. "
-                f"Hidden data may be embedded using pixel pair differences."
+        prob_dict = {name: float(probs[0][i].item()) for i, name in enumerate(config.CLASS_NAMES)}
+
+        # MODULE 2: Statistical Validation
+        validation = validate_and_route(str(temp_path), cnn_prediction=class_name, cnn_confidence=conf)
+        final_decision = validation["final_decision"]
+        combined_conf = validation["combined_confidence"]
+
+        # MODULE 3: Extraction
+        extraction_result = None
+        if final_decision in ("lsb", "pvd"):
+            extraction_result = extract_payload(str(temp_path), technique=final_decision, confidence=combined_conf)
+
+        # MODULE 4: NLP Classification
+        nlp_result = None
+        if extraction_result and extraction_result.extraction_quality != "failed" and extraction_result.payload_text:
+            nlp_result = NLP_CLASSIFIER.classify(
+                extraction_result.payload_text,
+                obfuscation_type=extraction_result.obfuscation_layer,
             )
 
-        # ── Technical details ─────────────────────────────────────────
+        processing_time = (time.time() - start_time) * 1000
+
+        # Risk level
+        payload_cat = nlp_result.label_name if nlp_result and nlp_result.label != -1 else None
+        risk_label, risk_color = compute_risk(final_decision, payload_cat, combined_conf)
+
+        # Format detection result
+        icons = {"clean": "&#9989;", "lsb": "&#9888;&#65039;", "pvd": "&#9888;&#65039;"}
+        icon = icons.get(final_decision, "")
+        if final_decision == "clean":
+            detection_text = f"### {icon} CLEAN\nNo steganography detected ({combined_conf*100:.1f}% confidence)"
+        else:
+            tech_name = "LSB (Least Significant Bit)" if final_decision == "lsb" else "PVD (Pixel Value Differencing)"
+            detection_text = f"### {icon} {final_decision.upper()} Steganography Detected\n**Technique:** {tech_name}\n**Confidence:** {combined_conf*100:.1f}%"
+
+        risk_text = f"### Risk Level: <span style='color:{risk_color};font-weight:bold'>{risk_label}</span>"
+
+        # Validation & extraction details
+        detail_parts = []
+        chi_result = validation["statistical_tests"]["chi_square"]
+        pvd_stat = validation["statistical_tests"]["ppdh"]
+
+        if validation["override_occurred"]:
+            detail_parts.append(f"> **Override:** {validation['warning']}\n")
+        elif validation["warning"]:
+            detail_parts.append(f"> **Note:** {validation['warning']}\n")
+
+        detail_parts.append("#### Module 2 - Statistical Validation")
+        if chi_result:
+            status = "Detected" if chi_result['lsb_detected'] else "Not detected"
+            detail_parts.append(f"- Chi-Square LSB: **{status}** (p={chi_result['p_value']:.4f})")
+        if pvd_stat:
+            status = "Detected" if pvd_stat['pvd_detected'] else "Not detected"
+            detail_parts.append(f"- PPDH PVD: **{status}** (score={pvd_stat['pvd_score']}/5)")
+
+        if extraction_result and extraction_result.extraction_quality != "failed":
+            detail_parts.append("\n#### Module 3 - Payload Extraction")
+            detail_parts.append(f"- Quality: **{extraction_result.extraction_quality}**")
+            detail_parts.append(f"- Printable ratio: {extraction_result.printable_ratio:.1%}")
+            detail_parts.append(f"- Size: {extraction_result.payload_bytes_length} bytes")
+            if extraction_result.obfuscation_layer != "none":
+                detail_parts.append(f"- Obfuscation: {extraction_result.obfuscation_layer}")
+            if extraction_result.fallback_used:
+                detail_parts.append(f"- Fallback technique: {extraction_result.technique_used}")
+            if extraction_result.payload_text:
+                snippet = extraction_result.payload_text[:500]
+                if len(extraction_result.payload_text) > 500:
+                    snippet += "... (truncated)"
+                detail_parts.append(f"\n**Payload Preview:**\n```\n{snippet}\n```")
+
+        if nlp_result and nlp_result.label != -1:
+            detail_parts.append("\n#### Module 4 - NLP Classification")
+            detail_parts.append(f"- **Payload type: {nlp_result.label_name}**")
+            detail_parts.append(f"- Confidence: {nlp_result.confidence*100:.1f}%")
+            detail_parts.append(f"- Classifier: {nlp_result.classifier_used}")
+        elif extraction_result and extraction_result.error:
+            detail_parts.append(f"\n#### Module 3 Error\n{extraction_result.error}")
+        elif final_decision in ("lsb", "pvd"):
+            detail_parts.append("\n#### Module 3\nExtraction quality: failed (no readable payload)")
+
+        details_text = "\n".join(detail_parts)
+
+        # Technical details
+        tech_text = ""
         if show_technical:
             tech_text = (
-                f"**CNN Prediction Probabilities:**\n"
-                f"```\n"
-                f"  clean:  {prob_dict['clean']:.4f}\n"
-                f"  lsb:    {prob_dict['lsb']:.4f}\n"
-                f"  pvd:    {prob_dict['pvd']:.4f}\n"
-                f"```\n\n"
-                f"**Processing time:** {processing_time:.0f} ms\n\n"
-                f"**Device:** {config.DEVICE}\n\n"
-                f"**Image size:** {w}×{h} pixels"
+                f"#### CNN Probabilities (Module 1)\n"
+                f"| Class | Probability |\n|-------|-------------|\n"
+                f"| clean | {prob_dict['clean']:.4f} |\n"
+                f"| lsb | {prob_dict['lsb']:.4f} |\n"
+                f"| pvd | {prob_dict['pvd']:.4f} |\n\n"
+                f"#### Pipeline Info\n"
+                f"- CNN: {class_name} ({conf*100:.1f}%) | Final: {final_decision} ({combined_conf*100:.1f}%)\n"
+                f"- Override: {'Yes' if validation['override_occurred'] else 'No'}\n"
+                f"- Model: {config.CNN_CONFIG['model_name']} ({config.CNN_CONFIG['input_size']}x{config.CNN_CONFIG['input_size']})\n"
+                f"- Processing: {processing_time:.0f}ms | Device: {config.DEVICE} | Image: {w}x{h}\n"
             )
-        else:
-            tech_text = ""
 
-        # ── JSON report ───────────────────────────────────────────────
+        # JSON report
         report = {
-            "detection": class_name,
-            "confidence": round(conf, 4),
-            "probabilities": {k: round(v, 4) for k, v in prob_dict.items()},
+            "module1_cnn": {"prediction": class_name, "confidence": round(conf, 4),
+                           "probabilities": {k: round(v, 4) for k, v in prob_dict.items()}},
+            "module2_validation": {"final_decision": final_decision,
+                                   "combined_confidence": round(combined_conf, 4),
+                                   "override": validation["override_occurred"]},
+            "module3_extraction": None,
+            "module4_nlp": None,
+            "risk_level": risk_label,
             "processing_time_ms": round(processing_time, 1),
-            "image_size": [w, h],
         }
+        if extraction_result:
+            report["module3_extraction"] = {
+                "quality": extraction_result.extraction_quality,
+                "byte_length": extraction_result.payload_bytes_length,
+                "obfuscation": extraction_result.obfuscation_layer,
+            }
+        if nlp_result and nlp_result.label != -1:
+            report["module4_nlp"] = {
+                "category": nlp_result.label_name,
+                "confidence": round(nlp_result.confidence, 4),
+                "classifier": nlp_result.classifier_used,
+            }
 
-        # Save report to temp file for download
         report_path = Path(tempfile.gettempdir()) / "stegodetect_report.json"
         with open(report_path, "w") as f:
-            json.dump(report, f, indent=4)
+            json.dump(report, f, indent=4, default=str)
 
-        return (detection_text, risk_level, details, tech_text, str(report_path))
+        return detection_text, risk_text, "", details_text, tech_text, str(report_path)
 
     except Exception as e:
-        return (f"❌ Error: {str(e)}", "", "", "", None)
+        return f"**Error:** {str(e)}", "", "", "", "", None
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Batch analysis
+# ──────────────────────────────────────────────────────────────────────
 def analyze_batch(files):
-    """Analyze multiple images and return a summary table."""
     if not files:
-        return "⚠️ Please upload images", None
-
+        return "Upload images to analyze.", None
     if not PIPELINE_LOADED:
-        return "⚠️ Models not loaded. Run training first.", None
+        return "[WARN] Models not loaded. Train first.", None
 
     results = []
     for file_obj in files:
         try:
             img = Image.open(file_obj.name).convert("RGB")
-            input_tensor = TRANSFORM(img).unsqueeze(0).to(config.DEVICE)
+            temp_path = Path(tempfile.gettempdir()) / f"stegodetect_batch_{Path(file_obj.name).name}"
+            img.save(str(temp_path), format="PNG")
+
+            input_tensor = preprocess_image(img)
             pred_class, confidence, probs = MODEL.predict_with_confidence(input_tensor)
-
-            pred_idx = pred_class.item()
+            class_name = config.CLASS_NAMES[pred_class.item()]
             conf = confidence.item()
-            class_name = config.CLASS_NAMES[pred_idx]
 
-            risk = "None" if class_name == "clean" else "High"
+            validation = validate_and_route(str(temp_path), cnn_prediction=class_name, cnn_confidence=conf)
+            final_decision = validation["final_decision"]
+            combined_conf = validation["combined_confidence"]
+
+            payload_info = "-"
+            nlp_info = "-"
+            if final_decision in ("lsb", "pvd"):
+                extraction = extract_payload(str(temp_path), final_decision, combined_conf)
+                if extraction.extraction_quality != "failed" and extraction.payload_text:
+                    nlp_result = NLP_CLASSIFIER.classify(extraction.payload_text, extraction.obfuscation_layer)
+                    payload_info = f"{extraction.extraction_quality}"
+                    nlp_info = nlp_result.label_name if nlp_result.label != -1 else "unknown"
+                else:
+                    payload_info = "failed"
+
+            risk_label, _ = compute_risk(final_decision, nlp_info if nlp_info != "-" else None, combined_conf)
 
             results.append({
                 "Filename": Path(file_obj.name).name,
-                "Technique": class_name.upper(),
-                "Confidence": f"{conf*100:.1f}%",
-                "Risk Level": risk,
+                "Detection": final_decision.upper(),
+                "Confidence": f"{combined_conf*100:.1f}%",
+                "Payload": payload_info,
+                "Category": nlp_info,
+                "Risk": risk_label,
             })
         except Exception as e:
             results.append({
                 "Filename": Path(file_obj.name).name,
-                "Technique": "ERROR",
-                "Confidence": "-",
-                "Risk Level": str(e),
+                "Detection": "ERROR", "Confidence": "-",
+                "Payload": "-", "Category": "-", "Risk": str(e)[:40],
             })
 
-    # Summary
-    clean_count = sum(1 for r in results if r["Technique"] == "CLEAN")
-    lsb_count = sum(1 for r in results if r["Technique"] == "LSB")
-    pvd_count = sum(1 for r in results if r["Technique"] == "PVD")
-    summary = (
-        f"**Results:** {len(results)} images analyzed\n\n"
-        f"🟢 Clean: {clean_count}  |  🔴 LSB: {lsb_count}  |  🔴 PVD: {pvd_count}"
-    )
+    clean_count = sum(1 for r in results if r["Detection"] == "CLEAN")
+    stego_count = len(results) - clean_count
+    summary = f"**{len(results)} images analyzed** | Clean: {clean_count} | Stego: {stego_count}"
 
-    # Build table
     import pandas as pd
-    df = pd.DataFrame(results)
-
-    return summary, df
+    return summary, pd.DataFrame(results)
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Gradio UI
+# Premium CSS
 # ──────────────────────────────────────────────────────────────────────
-
 CUSTOM_CSS = """
+/* Global */
 .gradio-container {
-    max-width: 1100px !important;
-    margin: auto;
+    max-width: 1280px !important;
+    margin: 0 auto;
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif !important;
 }
-.main-title {
-    text-align: center;
-    color: #1a1a2e;
-    margin-bottom: 0;
+
+/* Header */
+.header-banner {
+    background: linear-gradient(135deg, #0f172a 0%, #1e293b 50%, #334155 100%);
+    border-radius: 16px;
+    padding: 32px 40px;
+    margin-bottom: 24px;
+    border: 1px solid rgba(99, 102, 241, 0.2);
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.15);
 }
-.subtitle {
-    text-align: center;
-    color: #666;
-    font-size: 1.1em;
-    margin-top: 0;
+.header-banner h1 {
+    color: #f8fafc !important;
+    font-size: 2.2em !important;
+    font-weight: 800 !important;
+    margin: 0 0 4px 0 !important;
+    background: linear-gradient(135deg, #818cf8, #a78bfa, #c084fc);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    letter-spacing: -0.02em;
+}
+.header-banner p {
+    color: #94a3b8 !important;
+    font-size: 1.05em !important;
+    margin: 0 !important;
+}
+
+/* Tabs */
+.tab-nav button {
+    font-weight: 600 !important;
+    font-size: 0.95em !important;
+    padding: 12px 24px !important;
+    border-radius: 8px 8px 0 0 !important;
+    transition: all 0.2s ease !important;
+}
+.tab-nav button.selected {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    color: white !important;
+    border-color: #6366f1 !important;
+}
+
+/* Buttons */
+.primary-btn {
+    background: linear-gradient(135deg, #6366f1, #8b5cf6) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 700 !important;
+    font-size: 1.05em !important;
+    padding: 12px 32px !important;
+    border-radius: 12px !important;
+    transition: all 0.3s ease !important;
+    box-shadow: 0 4px 16px rgba(99, 102, 241, 0.3) !important;
+}
+.primary-btn:hover {
+    transform: translateY(-2px) !important;
+    box-shadow: 0 6px 24px rgba(99, 102, 241, 0.45) !important;
+}
+
+/* Cards */
+.result-card {
+    border-radius: 12px !important;
+    border: 1px solid #e2e8f0 !important;
+    padding: 16px !important;
+}
+
+/* Status indicator */
+.status-badge {
+    display: inline-block;
+    padding: 4px 12px;
+    border-radius: 20px;
+    font-weight: 600;
+    font-size: 0.85em;
 }
 """
 
+# ──────────────────────────────────────────────────────────────────────
+# About text
+# ──────────────────────────────────────────────────────────────────────
 ABOUT_TEXT = """
 ## What is Steganography?
 
@@ -246,108 +418,130 @@ ABOUT_TEXT = """
 (such as images) to avoid detection. Unlike encryption, which makes data unreadable,
 steganography hides the very existence of the secret message.
 
+---
+
+## StegoDetect Pipeline Architecture
+
+StegoDetect is a **4-module AI-powered pipeline** for detecting, validating, extracting,
+and classifying steganographic content in images.
+
+| Module | Method | Purpose |
+|--------|--------|---------|
+| **Module 1** | EfficientNet-B4 CNN | Classify images as clean / LSB / PVD |
+| **Module 2** | Chi-square + PPDH | Statistical confirmation or override |
+| **Module 3** | LSB/PVD reversal | Extract hidden payload bytes |
+| **Module 4** | Regex + TF-IDF + SVM | Classify payload type |
+
+---
+
 ## Detection Techniques
 
 ### LSB (Least Significant Bit)
 The most common image steganography technique. Data is hidden by replacing the least
-significant bits of pixel values. The visual change is imperceptible to the human eye,
-but can be detected statistically.
+significant bits of pixel values. Visually imperceptible, but detectable statistically.
 
 ### PVD (Pixel Value Differencing)
 A more advanced technique that embeds data in the differences between adjacent pixel pairs.
-Larger differences can hide more bits, making it harder to detect in textured regions.
+Larger differences can hide more bits, making detection harder in textured regions.
 
-## About StegoDetect
+---
 
-StegoDetect is a 4-module AI-powered pipeline:
+## Payload Categories (Module 4)
 
-1. **Module 1 — CNN Detection:** EfficientNet-B0 classifies images as clean, LSB, or PVD
-2. **Module 2 — Statistical Validation:** Chi-square and PPDH tests confirm findings
-3. **Module 3 — Payload Extraction:** Reverses the embedding algorithm to extract hidden data
-4. **Module 4 — NLP Classification:** Classifies extracted payloads (PowerShell, JavaScript, URLs, etc.)
+| Category | Risk | Description |
+|----------|------|-------------|
+| PowerShell | Critical | Command execution scripts |
+| JavaScript | High | Browser-based code injection |
+| JavaScript_HTML | High | Embedded HTML with scripts |
+| URL/IP | Medium-High | Command & control endpoints |
+| Ethereum Address | Medium | Cryptocurrency wallet addresses |
 
-### Tech Stack
-- **Model:** EfficientNet-B0 (pretrained on ImageNet, fine-tuned on steganography dataset)
-- **Framework:** PyTorch 2.1+
-- **Dataset:** 60,000 images (512×512 PNG) — clean, LSB, and PVD steganography
-- **NLP:** TF-IDF + SVM, with optional CodeBERT for obfuscated payloads
+---
 
-### Dataset Information
+## Technical Details
+
+- **CNN Model:** EfficientNet-B4 (19M params, 380x380 input)
+- **Framework:** PyTorch 2.1+ with mixed precision training
+- **Statistical Tests:** Chi-square for LSB, PPDH for PVD
+- **NLP Pipeline:** Regex -> TF-IDF+LinearSVC -> CodeBERT (optional)
+- **Dataset:** ~60,000 images (512x512 PNG)
+
 | Split | Clean | LSB | PVD | Total |
 |-------|-------|-----|-----|-------|
 | Train | 8,000 | 12,000 | 3,995 | 23,995 |
-| Test | 4,000 | 18,000 | 2,000 | 24,000 |
 | Val | 4,000 | 6,000 | 2,000 | 12,000 |
+| Test | 4,000 | 18,000 | 2,000 | 24,000 |
 """
 
 
+# ──────────────────────────────────────────────────────────────────────
+# Build UI
+# ──────────────────────────────────────────────────────────────────────
 def build_ui():
-    """Build the Gradio interface."""
     with gr.Blocks(
-        title="StegoDetect — Steganography Detection & Payload Analysis",
+        title="StegoDetect - AI Steganography Detection",
+        css=CUSTOM_CSS,
+        theme=gr.themes.Soft(
+            primary_hue="indigo",
+            secondary_hue="slate",
+            neutral_hue="slate",
+            font=gr.themes.GoogleFont("Inter"),
+        ),
     ) as demo:
-        gr.Markdown("# 🔍 StegoDetect", elem_classes=["main-title"])
-        gr.Markdown(
-            "AI-Powered Steganography Detection & Payload Analysis",
-            elem_classes=["subtitle"],
-        )
 
-        # ── Tab 1: Analyze Image ─────────────────────────────────────
-        with gr.Tab("🖼️ Analyze Image"):
-            with gr.Row():
-                with gr.Column(scale=1):
-                    image_input = gr.Image(
-                        label="Upload Image",
-                        type="pil",
-                        height=350,
-                    )
-                    show_tech = gr.Checkbox(
-                        label="Show technical details",
-                        value=False,
-                    )
-                    analyze_btn = gr.Button(
-                        "🔍 Analyze",
-                        variant="primary",
-                        size="lg",
-                    )
+        # Header
+        gr.HTML("""
+        <div class="header-banner">
+            <h1>StegoDetect</h1>
+            <p>AI-Powered Steganography Detection & Payload Analysis Pipeline</p>
+        </div>
+        """)
 
-                with gr.Column(scale=1):
+        status = "Ready" if PIPELINE_LOADED else "Models not loaded - train first"
+        status_color = "#10b981" if PIPELINE_LOADED else "#f59e0b"
+        gr.HTML(f"""<div style="text-align:right;margin:-16px 0 12px 0;">
+            <span style="color:{status_color};font-weight:600;font-size:0.85em;">
+            {status}</span></div>""")
+
+        # ── Tab 1: Analyze ───────────────────────────────────────────
+        with gr.Tab("Analyze Image", id="analyze"):
+            with gr.Row(equal_height=False):
+                with gr.Column(scale=2):
+                    image_input = gr.Image(label="Upload Image", type="pil", height=380)
+                    with gr.Row():
+                        show_tech = gr.Checkbox(label="Show technical details", value=False)
+                        analyze_btn = gr.Button("Analyze Image", variant="primary",
+                                                elem_classes=["primary-btn"], size="lg")
+
+                with gr.Column(scale=3):
                     detection_output = gr.Markdown(label="Detection Result")
                     risk_output = gr.Markdown(label="Risk Level")
-                    details_output = gr.Markdown(label="Details")
+                    details_spacer = gr.Markdown(visible=False)
+                    details_output = gr.Markdown(label="Analysis Details")
                     tech_output = gr.Markdown(label="Technical Details")
-                    report_download = gr.File(label="📥 Download JSON Report")
+                    report_download = gr.File(label="Download JSON Report")
 
             analyze_btn.click(
                 fn=analyze_single_image,
                 inputs=[image_input, show_tech],
-                outputs=[detection_output, risk_output, details_output, tech_output, report_download],
+                outputs=[detection_output, risk_output, details_spacer,
+                         details_output, tech_output, report_download],
             )
 
-        # ── Tab 2: Batch Analysis ────────────────────────────────────
-        with gr.Tab("📊 Batch Analysis"):
-            gr.Markdown("Upload multiple images (max 20) for bulk analysis.")
-            file_input = gr.Files(
-                label="Upload Images",
-                file_types=["image"],
-                file_count="multiple",
-            )
-            batch_btn = gr.Button("🔍 Analyze Batch", variant="primary")
-
+        # ── Tab 2: Batch ─────────────────────────────────────────────
+        with gr.Tab("Batch Analysis", id="batch"):
+            gr.Markdown("Upload multiple images for bulk analysis through the full 4-module pipeline.")
+            file_input = gr.Files(label="Upload Images", file_types=["image"], file_count="multiple")
+            batch_btn = gr.Button("Analyze Batch", variant="primary", elem_classes=["primary-btn"])
             batch_summary = gr.Markdown(label="Summary")
             batch_table = gr.Dataframe(
                 label="Results",
-                headers=["Filename", "Technique", "Confidence", "Risk Level"],
+                headers=["Filename", "Detection", "Confidence", "Payload", "Category", "Risk"],
             )
-
-            batch_btn.click(
-                fn=analyze_batch,
-                inputs=[file_input],
-                outputs=[batch_summary, batch_table],
-            )
+            batch_btn.click(fn=analyze_batch, inputs=[file_input], outputs=[batch_summary, batch_table])
 
         # ── Tab 3: About ─────────────────────────────────────────────
-        with gr.Tab("ℹ️ About"):
+        with gr.Tab("About", id="about"):
             gr.Markdown(ABOUT_TEXT)
 
     return demo
@@ -355,21 +549,10 @@ def build_ui():
 
 # ──────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    # Try loading models (will warn if not trained yet)
     loaded = load_models()
     if not loaded:
-        print("\n⚠  Starting UI without models — analysis will show error messages.")
-        print("   Train the model first: python training/train_module1.py\n")
+        print("\n[WARN] Starting UI without models - analysis will show error messages.")
+        print("   Train: python training/train_module1.py --epochs 50 --batch_size 16 --device cuda\n")
 
     demo = build_ui()
-    demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
-        share=False,
-        show_error=True,
-        theme=gr.themes.Soft(
-            primary_hue="blue",
-            secondary_hue="slate",
-        ),
-        css=CUSTOM_CSS,
-    )
+    demo.launch(server_name="127.0.0.1", server_port=7860, share=False, show_error=True)

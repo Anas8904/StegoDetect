@@ -1,10 +1,16 @@
 """
 StegoDetect - Module 1: CNN Steganalysis Classifier
 
-EfficientNet-B0 based classifier for 3-class steganography detection:
+EfficientNet-B4 based classifier for 3-class steganography detection:
     Class 0: clean  (no hidden data)
     Class 1: lsb    (LSB steganography detected)
     Class 2: pvd    (PVD steganography detected)
+
+Upgrade from B0 to B4 provides:
+    - 4x more parameters (19M vs 5.3M)
+    - Deeper feature extraction for subtle stego artifacts
+    - Higher input resolution (380x380 vs 224x224)
+    - Feature dim: 1792 vs 1280
 """
 
 import sys
@@ -21,11 +27,11 @@ import config
 
 class StegoClassifier(nn.Module):
     """
-    EfficientNet-B0 based steganalysis classifier.
+    EfficientNet-B4 based steganalysis classifier.
 
     Architecture:
-        - EfficientNet-B0 backbone (pretrained on ImageNet)
-        - Custom classification head with dropout
+        - EfficientNet-B4 backbone (pretrained on ImageNet)
+        - Enhanced classification head with BatchNorm + multi-layer dropout
         - Optional 4-channel input for noise-residual features
     """
 
@@ -39,15 +45,15 @@ class StegoClassifier(nn.Module):
         self.num_classes = num_classes
         self.use_noise_residual = use_noise_residual
 
-        # Load EfficientNet-B0 backbone without classification head
+        # Load EfficientNet-B4 backbone without classification head
         self.backbone = timm.create_model(
-            "efficientnet_b0",
+            config.CNN_CONFIG["model_name"],
             pretrained=True,
             num_classes=0,        # Remove original head
             global_pool="avg",
         )
 
-        # Feature dimension from backbone (1280 for EfficientNet-B0)
+        # Feature dimension from backbone (1792 for EfficientNet-B4)
         feature_dim = self.backbone.num_features
 
         # Modify first conv if using noise-residual (4 channels)
@@ -63,20 +69,25 @@ class StegoClassifier(nn.Module):
             )
             # Copy pretrained weights for first 3 channels
             new_conv.weight.data[:, :3, :, :] = original_conv.weight.data
-            # Initialize 4th channel weights to near-zero
-            new_conv.weight.data[:, 3:, :, :] = 0.01 * torch.randn_like(
-                new_conv.weight.data[:, 3:, :, :]
-            )
+            # Initialize 4th channel as mean of RGB weights (much better starting point
+            # than near-zero random — gives the noise channel pretrained feature extraction)
+            new_conv.weight.data[:, 3:, :, :] = original_conv.weight.data.mean(dim=1, keepdim=True)
             self.backbone.conv_stem = new_conv
 
-        # Classification head
+        # Enhanced classification head with intermediate projection
+        # B4's 1792-dim features benefit from a bottleneck layer
         self.classifier = nn.Sequential(
+            nn.BatchNorm1d(feature_dim),
             nn.Dropout(p=dropout),
-            nn.Linear(feature_dim, num_classes),
+            nn.Linear(feature_dim, 512),
+            nn.GELU(),
+            nn.BatchNorm1d(512),
+            nn.Dropout(p=dropout * 0.5),
+            nn.Linear(512, num_classes),
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: image tensor → class logits."""
+        """Forward pass: image tensor -> class logits."""
         features = self.backbone(x)
         return self.classifier(features)
 
@@ -135,7 +146,7 @@ def get_model_summary(model: StegoClassifier):
     frozen_params = total_params - trainable_params
     model_size_mb = sum(p.nelement() * p.element_size() for p in model.parameters()) / (1024 * 1024)
 
-    print(f"Model Summary:")
+    print(f"Model Summary ({config.CNN_CONFIG['model_name']}):")
     print(f"  Total parameters:     {total_params:>12,}")
     print(f"  Trainable parameters: {trainable_params:>12,}")
     print(f"  Frozen parameters:    {frozen_params:>12,}")
@@ -188,12 +199,14 @@ if __name__ == "__main__":
 
     device = config.DEVICE
     print(f"Device: {device}")
+    print(f"Model: {config.CNN_CONFIG['model_name']}")
+    print(f"Input size: {config.CNN_CONFIG['input_size']}x{config.CNN_CONFIG['input_size']}")
 
     # Create model
     model = StegoClassifier(
         num_classes=config.NUM_CLASSES,
         use_noise_residual=False,
-        dropout=0.3,
+        dropout=config.CNN_CONFIG["dropout"],
     )
     model.to(device)
 
@@ -201,8 +214,9 @@ if __name__ == "__main__":
     get_model_summary(model)
 
     # Test forward pass with random batch
-    print("\nTest forward pass:")
-    batch = torch.randn(4, 3, 224, 224).to(device)
+    input_size = config.CNN_CONFIG["input_size"]
+    print(f"\nTest forward pass:")
+    batch = torch.randn(4, 3, input_size, input_size).to(device)
     logits = model(batch)
     print(f"  Input shape:  {batch.shape}")
     print(f"  Output shape: {logits.shape}")

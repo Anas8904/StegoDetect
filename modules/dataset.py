@@ -119,35 +119,66 @@ class StegoDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    # SRM (Spatial Rich Model) high-pass kernels for steganalysis
+    # These are standard filters used in academic steganalysis research
+    _SRM_KERNEL_1 = np.array([[ 0,  0,  0,  0,  0],
+                               [ 0,  0,  0,  0,  0],
+                               [ 0,  1, -2,  1,  0],
+                               [ 0,  0,  0,  0,  0],
+                               [ 0,  0,  0,  0,  0]], dtype=np.float64)
+
+    _SRM_KERNEL_2 = np.array([[ 0,  0,  0,  0,  0],
+                               [ 0, -1,  2, -1,  0],
+                               [ 0,  2, -4,  2,  0],
+                               [ 0, -1,  2, -1,  0],
+                               [ 0,  0,  0,  0,  0]], dtype=np.float64)
+
+    _SRM_KERNEL_3 = np.array([[-1,  2, -2,  2, -1],
+                               [ 2, -6,  8, -6,  2],
+                               [-2,  8, -12, 8, -2],
+                               [ 2, -6,  8, -6,  2],
+                               [-1,  2, -2,  2, -1]], dtype=np.float64)
+
     def __getitem__(self, idx):
         img_path, label = self.samples[idx]
 
         # Load image
         image = Image.open(img_path).convert("RGB")
 
-        # Apply transforms
+        # Apply transforms (resize, flip, normalize for RGB)
         image_tensor = self.transform(image)
 
         # Optionally add noise-residual as 4th channel
         if self.use_noise_residual:
-            # Convert to numpy for Laplacian
-            img_np = np.array(image)
-            gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
-            laplacian = cv2.Laplacian(gray.astype(np.float64), cv2.CV_64F)
-
-            # Normalize to [0, 1]
-            lap_min, lap_max = laplacian.min(), laplacian.max()
-            if lap_max - lap_min > 0:
-                laplacian_norm = (laplacian - lap_min) / (lap_max - lap_min)
-            else:
-                laplacian_norm = np.zeros_like(laplacian)
-
-            # Resize to match transform output size
+            # Resize image FIRST so residual is spatially aligned with RGB tensor
             size = config.CNN_CONFIG["input_size"]
-            laplacian_resized = cv2.resize(laplacian_norm, (size, size))
+            img_resized = image.resize((size, size), Image.BILINEAR)
+            img_np = np.array(img_resized, dtype=np.float64)
+
+            # Compute SRM residuals on all 3 channels, then average
+            # This captures per-channel bit-level artifacts from LSB embedding
+            residuals = []
+            for kernel in [self._SRM_KERNEL_1, self._SRM_KERNEL_2, self._SRM_KERNEL_3]:
+                channel_residuals = []
+                for c in range(3):
+                    filtered = cv2.filter2D(img_np[:, :, c], cv2.CV_64F, kernel)
+                    channel_residuals.append(filtered)
+                # Average across RGB channels
+                residuals.append(np.mean(channel_residuals, axis=0))
+
+            # Average the 3 SRM kernel responses
+            noise_map = np.mean(residuals, axis=0)
+
+            # Standardize with fixed statistics (zero-mean, unit-variance)
+            # Using fixed scale preserves magnitude differences between clean/stego
+            # Typical SRM residual std is ~2-5 for natural images
+            noise_map = noise_map / 4.0  # Scale to roughly [-1, 1] range
+
+            # Clip extreme outliers
+            noise_map = np.clip(noise_map, -3.0, 3.0)
 
             # Convert to tensor and concatenate as 4th channel
-            noise_channel = torch.tensor(laplacian_resized, dtype=torch.float32).unsqueeze(0)
+            noise_channel = torch.tensor(noise_map, dtype=torch.float32).unsqueeze(0)
             image_tensor = torch.cat([image_tensor, noise_channel], dim=0)
 
         return image_tensor, label

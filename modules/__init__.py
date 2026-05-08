@@ -1,1 +1,1 @@
-# StegoDetect modules package
+# StegoDetect Modules
